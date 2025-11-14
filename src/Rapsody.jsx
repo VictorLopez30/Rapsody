@@ -1,14 +1,17 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Midi } from "@tonejs/midi";
 
-// Rapsody — Bouncing Balls Beatmaker (Vite + Tailwind)
-// ----------------------------------------------------
-// - Bolas que rebotan en un canvas; colisiones disparan sonidos.
-// - Renombrar bolas, mover con arrastre y “lanzar” para fijar dirección.
-// - Energía +/– para escalar velocidad.
-// - Añadir / quitar bolas, asignar instrumento.
-// - Presets (localStorage) y grabación .webm opcional.
 
 const rnd = (min, max) => Math.random() * (max - min) + min;
+
+// Subdivisiones específicas para bolas de tempo (puedes reutilizar QUANT_OPTIONS)
+const TEMPO_QUANT_OPTIONS = [
+  { label: "1/4", value: 1 / 4 },
+  { label: "1/8", value: 1 / 8 },
+  { label: "1/12 (ternario)", value: 1 / 12 },
+  { label: "1/16", value: 1 / 16 },
+  { label: "1/32", value: 1 / 32 },
+];
 
 const QUANT_OPTIONS = [
   { label: "1/4", value: 1 / 4 },
@@ -16,6 +19,600 @@ const QUANT_OPTIONS = [
   { label: "1/16", value: 1 / 16 },
   { label: "1/32", value: 1 / 32 },
 ];
+
+const QUANT_POOL = Array.from(
+  new Set([...QUANT_OPTIONS, ...TEMPO_QUANT_OPTIONS].map((opt) => opt.value))
+).sort((a, b) => a - b);
+const DEFAULT_TEMPOS = [
+  { quant: 1 / 8, velocity: 1.0, angleDeg: 10, speed: 450 },
+  { quant: 1 / 12, velocity: 0.95, angleDeg: -16, speed: 420 },
+];
+const THEME_OPTIONS = {
+  midnight: {
+    label: "Midnight",
+    bg: "210 16 12",
+    note: (i) => `hsl(${(12 + i * 14) % 360} 85% 60%)`,
+    tempo: (i) => `hsl(${(200 + i * 20) % 360} 70% 65%)`,
+  },
+  neon: {
+    label: "Neón",
+    bg: "275 55 10",
+    note: (i) => `hsl(${(300 + i * 25) % 360} 95% 60%)`,
+    tempo: (i) => `hsl(${(160 + i * 25) % 360} 90% 60%)`,
+  },
+  pastel: {
+    label: "Pastel",
+    bg: "180 30 92",
+    note: () => "hsl(15 60% 70%)",
+    tempo: () => "hsl(190 60% 65%)",
+  },
+};
+const MIDI_NOTE_LIMIT = 64;
+const FLAT_TO_SHARP_MAP = {
+  Bb: "A#",
+  Db: "C#",
+  Eb: "D#",
+  Gb: "F#",
+  Ab: "G#",
+  Cb: "B",
+  Fb: "E",
+};
+const clampValue = (val, min, max) => Math.max(min, Math.min(max, val));
+function normalizeNoteName(name) {
+  if (!name) return "A4";
+  const match = name.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
+  if (!match) return name;
+  const [, letterRaw, accidental = "", octave] = match;
+  const letter = letterRaw.toUpperCase();
+  const key = `${letter}${accidental}`;
+  const replacement = FLAT_TO_SHARP_MAP[key] || key;
+  return `${replacement}${octave}`;
+}
+function clampBpmValue(value, fallback = 100) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  return Math.max(50, Math.min(220, Math.round(num)));
+}
+function pickQuantFromBeats(beats) {
+  if (!Number.isFinite(beats) || beats <= 0) return null;
+  let best = QUANT_POOL[0];
+  let bestDiff = Infinity;
+  for (const q of QUANT_POOL) {
+    const beatValue = q * 4;
+    const diff = Math.abs(beatValue - beats);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = q;
+    }
+  }
+  return best;
+}
+async function extractPresetFromMidiFile(file) {
+  const buffer = await file.arrayBuffer();
+  const midi = new Midi(buffer);
+
+  const trackInfos = midi.tracks
+    .map((track, idx) => {
+      const notes = Array.isArray(track?.notes)
+        ? track.notes.filter((note) => (note?.duration ?? 0) > 0 || (note?.durationTicks ?? 0) > 0)
+        : [];
+      return {
+        idx,
+        isPercussion: Boolean(track?.instrument?.percussion || track?.channel === 9),
+        notes,
+      };
+    })
+    .filter((info) => info.notes.length);
+
+  if (!trackInfos.length) throw new Error("El archivo MIDI no contiene notas reproducibles.");
+
+  trackInfos.sort((a, b) => {
+    if (a.isPercussion !== b.isPercussion) return a.isPercussion ? 1 : -1;
+    return b.notes.length - a.notes.length;
+  });
+
+  const chosenTrack = trackInfos[0];
+  const sortedNotes = [...chosenTrack.notes].sort((a, b) => {
+    const posA = (a?.ticks ?? 0) || (a?.time ?? 0);
+    const posB = (b?.ticks ?? 0) || (b?.time ?? 0);
+    return posA - posB;
+  });
+
+  const sanitizedEvents = sortedNotes.map((note) => {
+    const name = normalizeNoteName(note?.name ?? nameFromMidi(note?.midi ?? 69));
+    return {
+      name,
+      start: note?.time ?? ((note?.ticks ?? 0) / (midi.header?.ppq ?? 480)) * ((60 / (midi.header?.tempos?.[0]?.bpm ?? midi.header?.bpm ?? 100)) || 0.5),
+      duration: note?.duration ?? ((note?.durationTicks ?? 0) / (midi.header?.ppq ?? 480)) * ((60 / (midi.header?.tempos?.[0]?.bpm ?? midi.header?.bpm ?? 100)) || 0.5),
+      velocity: note?.velocity ?? 0.9,
+    };
+  });
+  const trimmedEvents = sanitizedEvents.filter((ev) => ev.name).slice(0, MIDI_NOTE_LIMIT);
+  if (!trimmedEvents.length) throw new Error("No pude extraer notas legibles del MIDI.");
+  const trimmedNotes = trimmedEvents.map((ev) => ev.name);
+
+  const bpmCandidate = midi.header?.tempos?.length
+    ? midi.header.tempos[0].bpm
+    : midi.header?.bpm;
+  const bpm = clampBpmValue(bpmCandidate);
+  const ppq = midi.header?.ppq ?? 480;
+
+  const durationBeats = sortedNotes
+    .map((note) => {
+      if (note?.durationTicks && ppq) return note.durationTicks / ppq;
+      if (note?.duration && bpm) return note.duration / (60 / bpm);
+      return null;
+    })
+    .filter((val) => Number.isFinite(val) && val > 0.03)
+    .sort((a, b) => a - b);
+
+  const medianBeats =
+    durationBeats.length > 0
+      ? durationBeats[Math.floor(durationBeats.length / 2)]
+      : null;
+  const baseQuant = pickQuantFromBeats(medianBeats ?? 0.5) || 1 / 8;
+  const baseIndex = QUANT_POOL.indexOf(baseQuant);
+  const altQuant =
+    QUANT_POOL[
+      baseIndex >= 0 ? Math.min(baseIndex + 1, QUANT_POOL.length - 1) : QUANT_POOL.length - 1
+    ] || 1 / 16;
+
+  const avgVelocity =
+    sortedNotes.reduce((sum, note) => sum + (note?.velocity ?? 0.9), 0) / sortedNotes.length || 0.9;
+
+  const tempos = [
+    { quant: baseQuant, velocity: clampValue(avgVelocity * 1.1, 0.4, 1.4), angleDeg: 12, speed: 440 },
+    { quant: altQuant, velocity: clampValue(avgVelocity * 0.9, 0.4, 1.2), angleDeg: -18, speed: 480 },
+  ];
+
+  return { notes: trimmedNotes, noteEvents: trimmedEvents, bpm, tempos };
+}
+
+async function extractPresetFromAudioFile(file) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioCtx();
+  try {
+    const arrBuf = await file.arrayBuffer();
+    const audioBuf = await ctx.decodeAudioData(arrBuf);
+    const notesDetected = extractNotesFromAudioBuffer(audioBuf);
+    if (!notesDetected.length) throw new Error("No pude detectar notas (la señal puede ser muy densa o ruidosa).");
+    const noteEvents = notesDetected
+      .map((n) => ({
+        name: n.note,
+        start: n.start,
+        duration: n.dur,
+        velocity: (n.freq ? Math.min(1, Math.max(0.2, n.freq / 1200)) : 0.9),
+      }))
+      .slice(0, 96);
+    const notesNames = noteEvents.map((n) => n.name);
+    const mono = audioBuf.numberOfChannels > 1
+      ? (() => {
+          const a = audioBuf.getChannelData(0);
+          const b = audioBuf.getChannelData(1);
+          const n = Math.min(a.length, b.length);
+          const m = new Float32Array(n);
+          for (let i = 0; i < n; i++) m[i] = (a[i] + b[i]) * 0.5;
+          return m;
+        })()
+      : audioBuf.getChannelData(0);
+    const onsets = detectOnsetsMono(mono, audioBuf.sampleRate);
+    const estBPM = estimateBPMFromOnsets(onsets);
+    const tempos = DEFAULT_TEMPOS;
+    return { notes: notesNames, noteEvents, bpm: estBPM, tempos };
+  } finally {
+    ctx.close?.();
+  }
+}
+
+function splitNotesIntoSections(notes, { maxSections = 4, minPerSection = 6 } = {}) {
+  if (!Array.isArray(notes) || notes.length === 0) return [];
+  if (notes.length <= minPerSection) return [notes];
+  const sections = Math.min(maxSections, Math.max(2, Math.ceil(notes.length / minPerSection)));
+  const chunk = Math.ceil(notes.length / sections);
+  const out = [];
+  for (let i = 0; i < notes.length; i += chunk) {
+    out.push(notes.slice(i, i + chunk));
+  }
+  return out;
+}
+
+function splitNotesByMusicalAnalysis(events, {
+  maxSections = 6,
+  minPerSection = 4,
+  minGapSeconds = 0.9,
+  adaptiveFactor = 1.6,
+} = {}) {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  const sorted = [...events].sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
+  if (sorted.length <= minPerSection) return [sorted];
+
+  const intervals = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const curr = sorted[i];
+    const delta = Math.max(0, (curr.start ?? 0) - ((prev.start ?? 0) + (prev.duration ?? 0.2)));
+    intervals.push(delta);
+  }
+  const sortedIntervals = intervals.filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+  const medianGap = sortedIntervals.length
+    ? sortedIntervals[Math.floor(sortedIntervals.length / 2)]
+    : 0.6;
+  const gapThreshold = Math.max(minGapSeconds, medianGap * adaptiveFactor);
+
+  const sections = [];
+  let current = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const curr = sorted[i];
+    const gap = Math.max(0, (curr.start ?? 0) - ((prev.start ?? 0) + (prev.duration ?? 0.2)));
+    if ((gap > gapThreshold && current.length >= minPerSection) || current.length >= Math.ceil(sorted.length / Math.max(2, maxSections))) {
+      sections.push(current);
+      current = [curr];
+    } else {
+      current.push(curr);
+    }
+  }
+  if (current.length) sections.push(current);
+
+  if (sections.length > maxSections) {
+    const merged = [];
+    const step = Math.ceil(sections.length / maxSections);
+    for (let i = 0; i < sections.length; i += step) {
+      merged.push(sections.slice(i, i + step).flat());
+    }
+    return merged;
+  }
+
+  return sections.filter((sec) => sec.length);
+}
+
+
+// --- PRESETS CON POLIRRITMIA (muchas canciones famosas, sencillas) ---
+const SONG_PRESETS = {
+  // Siguen los que ya tenías
+  sevenNation: {
+    label: "Seven Nation Army (riff)",
+    bpm: 120,
+    notes: ["E3","E3","G3","E3","D3","C3","B2","E3"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 0,   speed: 420 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 18,  speed: 380 },
+    ],
+  },
+
+  furElise: {
+    label: "Für Elise (motivo)",
+    bpm: 100,
+    notes: ["E5","D#5","E5","D#5","E5","B4","D5","C5","A4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 12,  speed: 400 },
+      { quant: 1/16, velocity: 0.8, angleDeg: -10, speed: 460 },
+    ],
+  },
+
+  odeToJoy: {
+    label: "Ode to Joy",
+    bpm: 112,
+    notes: ["E4","E4","F4","G4","G4","F4","E4","D4","C4","C4","D4","E4","E4","D4","D4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 8,   speed: 420 },
+      { quant: 1/12, velocity: 0.9, angleDeg: -18, speed: 440 },
+    ],
+  },
+
+  bellaCiao: {
+    label: "Bella Ciao (motivo)",
+    bpm: 108,
+    notes: ["E4","F4","G4","A4","G4","F4","E4","F4","G4","A4","B4","A4","G4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 15,  speed: 410 },
+      { quant: 1/16, velocity: 0.8, angleDeg: -22, speed: 480 },
+    ],
+  },
+
+  // ---------- MARIO (más partes) ----------
+  mario_intro: {
+    label: "Super Mario (intro)",
+    bpm: 150,
+    notes: ["E5","E5","E5","C5","E5","G5","G4","C5","G4","E4","A4","B4","A#4","A4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 0,   speed: 500 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 22,  speed: 460 },
+      { quant: 1/16, velocity: 0.8, angleDeg: -18, speed: 520 },
+    ],
+  },
+
+  mario_overworld_A: {
+    label: "Super Mario (Overworld A)",
+    bpm: 150,
+    notes: [
+      "E5","C5","D5","B4","C5","A4","A4","C4",
+      "E4","A4","B4","A#4","A4","G4","E5","G5","A5"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: -8, speed: 510 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 14, speed: 470 },
+    ],
+  },
+
+  mario_overworld_B: {
+    label: "Super Mario (Overworld B)",
+    bpm: 150,
+    notes: [
+      "F5","D5","E5","C5","D5","B4","C5","A4",
+      "A4","C4","E4","A4","B4","E4","C5","A4","G4"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 10,  speed: 520 },
+      { quant: 1/16, velocity: 0.85,angleDeg: -16, speed: 500 },
+    ],
+  },
+
+  mario_underground: {
+    label: "Super Mario (Underground)",
+    bpm: 120,
+    notes: ["C4","C5","A3","A4","A#3","A#4","C4","C5","A3","A4","A#3","A#4","F3","F4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: -6, speed: 420 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 18, speed: 380 },
+    ],
+  },
+
+  // ---------- NUEVAS: famosas y sencillas ----------
+  happyBirthday: {
+    label: "Happy Birthday",
+    bpm: 96,
+    notes: [
+      "G4","G4","A4","G4","C5","B4",
+      "G4","G4","A4","G4","D5","C5",
+      "G4","G4","G5","E5","C5","B4","A4",
+      "F5","F5","E5","C5","D5","C5"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 8,   speed: 420 },
+      { quant: 1/12, velocity: 0.9, angleDeg: -14, speed: 440 },
+    ],
+  },
+
+  twinkle: {
+    label: "Twinkle Twinkle",
+    bpm: 90,
+    notes: [
+      "C4","C4","G4","G4","A4","A4","G4",
+      "F4","F4","E4","E4","D4","D4","C4"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 0.9, angleDeg: 0,   speed: 380 },
+      { quant: 1/16, velocity: 0.8, angleDeg: 16,  speed: 420 },
+    ],
+  },
+
+  jingleBells: {
+    label: "Jingle Bells (motivo)",
+    bpm: 120,
+    notes: [
+      "E4","E4","E4","E4","E4","E4",
+      "E4","G4","C4","D4","E4",
+      "F4","F4","F4","F4","F4","E4","E4","E4","E4",
+      "D4","D4","E4","D4","G4"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: -10, speed: 430 },
+      { quant: 1/12, velocity: 0.85,angleDeg: 18,  speed: 410 },
+    ],
+  },
+
+  imperialMarch: {
+    label: "Imperial March",
+    bpm: 100,
+    notes: [
+      "G4","G4","G4","D#4","A#4","G4","D#4","A#4","G4",
+      "D5","D5","D5","D#5","A#4","F#4","D#4","A#4","G4"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.1, angleDeg: 6,   speed: 440 },
+      { quant: 1/16, velocity: 0.9, angleDeg: -18, speed: 460 },
+    ],
+  },
+
+  starWarsMain: {
+    label: "Star Wars (tema)",
+    bpm: 108,
+    notes: [
+      "G4","G4","G4","D#4","A#4","G4","D#4","A#4","G4",
+      "D5","D5","D5","D#5","A#4","F#4","D#4","A#4","G4"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 10,  speed: 420 },
+      { quant: 1/12, velocity: 0.9, angleDeg: -20, speed: 400 },
+    ],
+  },
+
+  tetris: {
+    label: "Tetris (Korobeiniki)",
+    bpm: 150,
+    notes: [
+      "E4","B3","C4","D4","C4","B3","A3","A3",
+      "C4","E4","D4","C4","B3","C4","D4","E4",
+      "C4","A3","A3"
+    ],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 0,   speed: 520 },
+      { quant: 1/16, velocity: 0.85,angleDeg: 22,  speed: 480 },
+    ],
+  },
+
+  nokia: {
+    label: "Nokia Tune",
+    bpm: 132,
+    notes: ["E5","D#5","F#4","G#4","C#5","B4","D4","E4","B4","A4","C#4","E4","A4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 12,  speed: 460 },
+      { quant: 1/12, velocity: 0.9, angleDeg: -16, speed: 420 },
+    ],
+  },
+
+  pinkPanther: {
+    label: "Pink Panther (motivo)",
+    bpm: 110,
+    notes: ["E4","G4","A4","A#4","A4","G4","E4","C#4","E4","G4","A4","E4","G4","A4","A#4"],
+    tempos: [
+      { quant: 1/8,  velocity: 0.95,angleDeg: -6,  speed: 420 },
+      { quant: 1/16, velocity: 0.85,angleDeg: 18,  speed: 460 },
+    ],
+  },
+
+  weWillRockYou: {
+    label: "We Will Rock You (motivo nota)",
+    bpm: 84,
+    notes: ["G3","G3","G3","G3","A#3","G3"], // aproximación melódica simple
+    tempos: [
+      { quant: 1/8,  velocity: 1.2, angleDeg: 0,   speed: 360 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 14,  speed: 340 },
+    ],
+  },
+
+  zeldaLullaby: {
+    label: "Zelda's Lullaby",
+    bpm: 96,
+    notes: ["A4","D5","F#5","A5","F#5","D5","A4","D5","F#5","A5","F#5","D5"],
+    tempos: [
+      { quant: 1/8,  velocity: 0.95,angleDeg: -8,  speed: 380 },
+      { quant: 1/16, velocity: 0.85,angleDeg: 16,  speed: 420 },
+    ],
+  },
+
+  pirates: {
+    label: "Pirates (motivo)",
+    bpm: 132,
+    notes: ["D4","F4","G4","A#4","A4","G4","F4","G4","A4","A#4","C5","D5"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 10,  speed: 470 },
+      { quant: 1/12, velocity: 0.9, angleDeg: -14, speed: 430 },
+    ],
+  },
+
+  shapeOfYou: {
+    label: "Shape of You (riff)",
+    bpm: 96,
+    notes: ["C#4","C#4","C#4","D#4","F#4","F#4","D#4","C#4","B3","B3","C#4","D#4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: -6,  speed: 400 },
+      { quant: 1/16, velocity: 0.85,angleDeg: 18,  speed: 450 },
+    ],
+  },
+
+  clocks: {
+    label: "Clocks (arpegio)",
+    bpm: 130,
+    notes: ["D#5","A#4","F4","D#5","A#4","F4","D#5","A#4","F4"],
+    tempos: [
+      { quant: 1/8,  velocity: 1.0, angleDeg: 0,   speed: 460 },
+      { quant: 1/12, velocity: 0.9, angleDeg: 20,  speed: 420 },
+      { quant: 1/16, velocity: 0.8, angleDeg: -16, speed: 480 },
+    ],
+  },
+};
+
+
+
+
+function hsl(h, s, l){ return `hsl(${h} ${s}% ${l}%)`; }
+
+function getThemePalette(themeKey) {
+  return THEME_OPTIONS[themeKey] || THEME_OPTIONS.midnight;
+}
+
+function applyThemeToBalls(balls, palette) {
+  return balls.map((ball, idx) => ({
+    ...ball,
+    color: ball.type === "tempo" ? palette.tempo(idx) : palette.note(idx),
+  }));
+}
+
+// Distribuye NOTAS en dos filas alternas y crea varias TEMPO-balls con ángulos distintos.
+// Así garantizamos cruces reales nota↔tempo (no se queda golpeando solo la primera).
+function buildSequencePreset({
+  notes, tempos, bpm,
+  areaW = 900, areaH = 420,
+}) {
+  const marginX = 60;
+  const marginY = 60;
+  const usableW = Math.max(240, areaW - marginX*2);
+  const centerY = Math.floor(areaH * 0.5);
+
+  const yTop = Math.max(marginY, centerY - 80);
+  const yBot = Math.min(areaH - marginY, centerY + 80);
+
+  const rNote  = 14;
+  const rTempo = 12;
+
+  const balls = [];
+  // --- Notas: colocación alternando filas (arriba/abajo) a lo ancho ---
+  const n = notes.length;
+  for (let i = 0; i < n; i++){
+    const t = (n === 1) ? 0.5 : (i/(n-1)); // 0..1
+    const x = Math.floor(marginX + t * usableW);
+    const y = (i % 2 === 0) ? yTop : yBot; // alterna arriba/abajo
+    balls.push({
+      id: i+1,
+      name: `N${i+1}`,
+      x, y,
+      vx: 0, vy: 0,
+      r: rNote,
+      color: hsl((12 + i*14) % 360, 85, 60),
+      type: "note",
+      isNote: true,
+      note: notes[i],
+      voice: "blip",
+      tempoQuant: 1/8,
+      velocity: 1.0,
+    });
+  }
+
+  // --- Tempos: varias bolas con ángulos distintos y offsets para evitar loops tontos ---
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const baseY = centerY;
+  const baseXLeft  = marginX - 25;             // arrancan un poco afuera
+  const baseXRight = areaW - marginX + 25;
+
+  tempos.forEach((tSpec, k) => {
+    const id = n + 1 + k;
+    const angle = toRad(tSpec.angleDeg || 0);
+    const speed = tSpec.speed || 420;
+    // dirección inicial en componentes
+    let vx = Math.cos(angle) * speed;
+    let vy = Math.sin(angle) * speed;
+
+    // alterna algunos saliendo desde la izq y otros desde la der
+    const fromLeft = (k % 2 === 0);
+    const x0 = fromLeft ? baseXLeft : baseXRight;
+    const y0 = baseY + (k - (tempos.length-1)/2) * 28; // pequeñas bandas verticales
+
+    // si salen desde la derecha, invertimos vx
+    if (!fromLeft) vx = -vx;
+
+    balls.push({
+      id,
+      name: `T${k+1}`,
+      x: x0, y: y0,
+      vx, vy,
+      r: rTempo,
+      color: hsl(200 + 24*k, 85, 65),
+      type: "tempo",
+      isNote: false,
+      note: "A4",
+      tempoQuant: tSpec.quant ?? 1/8,
+      velocity: Math.max(0.3, Math.min(1.5, tSpec.velocity ?? 1.0)),
+      voice: "blip",
+    });
+  });
+
+  return { balls, bpm };
+}
+
+
+
 
 const VOICES = [
   { label: "Kick", value: "kick" },
@@ -29,16 +626,36 @@ const VOICES = [
   { label: "Clave", value: "clave" },
   { label: "Blip", value: "blip" },
 ];
+const DEFAULT_BG = "210 16 12";
+
+// --- Notas A0..C8 (88 teclas) ---
+const NOTE_NAMES_88 = (() => {
+  const names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  // El piano real va de A0 (midi 21) a C8 (midi 108)
+  const list = [];
+  for (let midi = 21; midi <= 108; midi++) {
+    const n = names[midi % 12];
+    const o = Math.floor(midi / 12) - 1;
+    list.push(`${n}${o}`);
+  }
+  return list;
+})();
+
+function midiFromNoteName(note) {
+  const map = { C:0,"C#":1,D:2,"D#":3,E:4,F:5,"F#":6,G:7,"G#":8,A:9,"A#":10,B:11 };
+  const m = note.match(/^([A-G]#?)(-?\d+)$/);
+  if (!m) return 69; // A4
+  const [, n, o] = m;
+  return 12 * (parseInt(o,10) + 1) + (map[n] ?? 0);
+}
 
 
-// --- Web Audio: síntesis simple de percusiones ---
+
 function createAudio() {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   const ctx = new AudioCtx();
 
-  const master = ctx.createGain();
-  master.gain.value = 0.9;
-  master.connect(ctx.destination);
+ 
 
   // ruido compartido
   const noiseBuffer = (() => {
@@ -120,6 +737,42 @@ function createAudio() {
       osc.start(time);
       osc.stop(time + 0.13);
     },
+    pad(time = ctx.currentTime, freq = 330) {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(freq, time);
+      const lfo = ctx.createOscillator();
+      const lfoGain = ctx.createGain();
+      lfo.frequency.value = 5;
+      lfoGain.gain.value = 8;
+      lfo.connect(lfoGain).connect(osc.frequency);
+      g.gain.setValueAtTime(0.0001, time);
+      g.gain.linearRampToValueAtTime(0.25, time + 0.05);
+      g.gain.exponentialRampToValueAtTime(0.0001, time + 2.2);
+      const filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.value = freq * 3;
+      osc.connect(filter).connect(g).connect(master);
+      lfo.start(time);
+      osc.start(time);
+      osc.stop(time + 2.3);
+      lfo.stop(time + 2.3);
+    },
+    bass(time = ctx.currentTime, freq = 110) {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(freq, time);
+      g.gain.setValueAtTime(0.35, time);
+      g.gain.exponentialRampToValueAtTime(0.0001, time + 0.5);
+      const filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.value = freq * 2;
+      osc.connect(filter).connect(g).connect(master);
+      osc.start(time);
+      osc.stop(time + 0.6);
+    },
     // Clap: ruido + breve “snap”
 clap(time = ctx.currentTime) {
   const noise = ctx.createBufferSource();
@@ -198,11 +851,112 @@ rim(time = ctx.currentTime) {
 
   };
 
-  // Para grabación (opcional)
-  const mediaDest = ctx.createMediaStreamDestination();
-  master.connect(mediaDest);
+  const master = ctx.createGain();
+  master.gain.value = 0.9;
 
-  return { ctx, master, voices, mediaDest };
+  // --- Compresor/Limiter master ---
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -12;
+  comp.knee.value = 20;
+  comp.ratio.value = 12;
+  comp.attack.value = 0.003;
+  comp.release.value = 0.15;
+
+  // efectos
+  const dry = ctx.createGain();
+  const wet = ctx.createGain();
+  const delay = ctx.createDelay(0.8);
+  const feedback = ctx.createGain();
+  feedback.gain.value = 0.35;
+  delay.connect(feedback).connect(delay);
+  const reverb = ctx.createConvolver();
+  const reverbGain = ctx.createGain();
+  reverbGain.gain.value = 0.4;
+  // simple impulse
+  const impulse = ctx.createBuffer(2, ctx.sampleRate * 1.5, ctx.sampleRate);
+  for (let ch = 0; ch < impulse.numberOfChannels; ch++) {
+    const buf = impulse.getChannelData(ch);
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / buf.length, 2);
+    }
+  }
+  reverb.buffer = impulse;
+
+  master.connect(dry).connect(comp);
+  master.connect(delay).connect(wet);
+  master.connect(reverb).connect(reverbGain).connect(wet);
+  wet.connect(comp);
+
+  const setFxEnabled = (enabled) => {
+    wet.gain.value = enabled ? 0.9 : 0;
+    delay.delayTime.value = enabled ? 0.65 : 0.4;
+    feedback.gain.value = enabled ? 0.35 : 0.15;
+  };
+  setFxEnabled(true);
+  delay.connect(feedback);
+  feedback.connect(delay);
+  delay.connect(wet);
+
+  comp.connect(ctx.destination);
+  const mediaDest = ctx.createMediaStreamDestination();
+  comp.connect(mediaDest);
+
+
+  // --- SINTESIS DE NOTA (piano-like simple, sin samples) ---
+function playNoteByName(noteName, when = ctx.currentTime, vel = 1.0) {
+  const midi = midiFromNoteName(noteName);
+  const f0 = freqFromMidi(midi);
+
+  // osciladores básicos: fundamental + 2º armónico suave
+  const osc1 = ctx.createOscillator();
+  const osc2 = ctx.createOscillator();
+  osc1.type = "sine";
+  osc2.type = "sine";
+  osc1.frequency.setValueAtTime(f0, when);
+  osc2.frequency.setValueAtTime(f0 * 2, when);
+
+  // mezclador y envolvente
+  const g = ctx.createGain();
+  const o2g = ctx.createGain(); // nivel del armónico
+
+  // envolvente tipo piano (ataque rápido, decaimiento exponencial)
+  const A = 0.002;       // ataque ~2ms
+  const D = 1.2;         // decaimiento ~1.2s
+  const peak = 0.9 * vel;
+
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + A);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + D);
+
+  // armónico más bajo de nivel
+  o2g.gain.setValueAtTime(0.15 * vel, when);
+  o2g.gain.exponentialRampToValueAtTime(0.0001, when + D * 0.8);
+
+  // filtro lowpass que se va cerrando (para “apagarse” tipo piano)
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.setValueAtTime(Math.max(1200, f0 * 6), when);
+  lp.frequency.exponentialRampToValueAtTime(800, when + D * 0.4);
+  lp.frequency.exponentialRampToValueAtTime(300, when + D);
+
+  osc1.connect(g);
+  osc2.connect(o2g).connect(g);
+  g.connect(lp).connect(master);
+
+  osc1.start(when);
+  osc2.start(when);
+  osc1.stop(when + D + 0.05);
+  osc2.stop(when + D + 0.05);
+}
+
+
+  return { ctx, master, voices, mediaDest, playNoteByName, setFxEnabled };
+}
+
+let sharedAudio = null;
+function getSharedAudio() {
+  if (!sharedAudio) sharedAudio = createAudio();
+  return sharedAudio;
 }
 
 function nextQuantizedTime(ctxTime, bpm, subdivision) {
@@ -213,43 +967,314 @@ function nextQuantizedTime(ctxTime, bpm, subdivision) {
   return steps * step;
 }
 
-export default function Rapsody() {
+
+// === Utils nota <-> frecuencia ===
+function midiFromFreq(f) { return 69 + 12 * Math.log2(f / 440); }
+function freqFromMidi(m, A4=440){ return A4 * Math.pow(2, (m-69)/12); }
+function nameFromMidi(m) {
+  const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const mi = Math.round(m);
+  const name = NAMES[(mi % 12 + 12) % 12];
+  const oct  = Math.floor(mi/12) - 1;
+  return `${name}${oct}`;
+}
+
+// === YIN: pitch detection por ventana (time-domain) ===
+function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
+  const N = frame.length;
+  const tauMin = Math.floor(sampleRate / maxF);
+  const tauMax = Math.floor(sampleRate / minF);
+  const diff = new Float32Array(tauMax+1);
+  diff.fill(0);
+
+  // diferencia acumulada
+  for (let tau = 1; tau <= tauMax; tau++) {
+    let d = 0;
+    for (let i = 0; i < N - tau; i++) {
+      const delta = frame[i] - frame[i + tau];
+      d += delta * delta;
+    }
+    diff[tau] = d;
+  }
+  // CMNDF
+  let running = 0;
+  for (let tau = 1; tau <= tauMax; tau++) {
+    running += diff[tau];
+    diff[tau] = diff[tau] * tau / (running || 1e-12);
+  }
+
+  // primer mínimo bajo umbral
+  let tau = tauMin;
+  let best = -1;
+  for (tau = tauMin; tau <= tauMax; tau++) {
+    if (diff[tau] < threshold) { best = tau; break; }
+  }
+  if (best === -1) {
+    // si no cruzó el umbral, usa el mínimo global
+    let minV = Infinity, minI = -1;
+    for (let t = tauMin; t <= tauMax; t++) {
+      if (diff[t] < minV) { minV = diff[t]; minI = t; }
+    }
+    best = minI;
+  }
+  if (best <= 0) return null;
+
+  // parabolic interpolation para afinar
+  const x0 = diff[best-1] ?? diff[best];
+  const x1 = diff[best];
+  const x2 = diff[best+1] ?? diff[best];
+  const denom = (x0 + x2 - 2*x1);
+  const shift = denom ? 0.5 * (x0 - x2) / denom : 0;
+  const tauEst = Math.max(1, best + shift);
+
+  const freq = sampleRate / tauEst;
+  if (!isFinite(freq) || freq <= 0) return null;
+  return freq;
+}
+
+// === Onsets simples por energía corta (RMS) + derivada ===
+function detectOnsetsMono(samples, sampleRate, hop=512, win=2048, rmsThresh=0.02, derivThresh=0.015) {
+  const n = samples.length;
+  const onsets = [];
+  const rmsArr = [];
+
+  // RMS por ventana con hop
+  for (let start = 0; start + win <= n; start += hop) {
+    let sum = 0;
+    for (let i = 0; i < win; i++) {
+      const v = samples[start+i];
+      sum += v*v;
+    }
+    const rms = Math.sqrt(sum / win);
+    rmsArr.push(rms);
+  }
+
+  // derivada positiva significativa
+  for (let i = 1; i < rmsArr.length; i++) {
+    const dr = rmsArr[i] - rmsArr[i-1];
+    if (rmsArr[i] > rmsThresh && dr > derivThresh) {
+      const t = (i * hop) / sampleRate;
+      // evita disparos demasiado cercanos (< 90 ms)
+      if (onsets.length === 0 || (t - onsets[onsets.length - 1]) > 0.09) {
+        onsets.push(t);
+      }
+    }
+  }
+  // garantiza al menos un onset
+  if (onsets.length === 0) onsets.push(0);
+  return onsets;
+}
+
+// === Estimación de notas por segmento (entre onsets) ===
+function extractNotesFromAudioBuffer(audioBuffer, {
+  downsampleTo = 22050,
+  hop = 256,
+  win = 2048,
+  yinThresh = 0.10,
+} = {}) {
+  // 1) mezcla a mono
+  const ch0 = audioBuffer.getChannelData(0);
+  let mono = ch0;
+  if (audioBuffer.numberOfChannels > 1) {
+    const ch1 = audioBuffer.getChannelData(1);
+    const n = Math.min(ch0.length, ch1.length);
+    mono = new Float32Array(n);
+    for (let i = 0; i < n; i++) mono[i] = 0.5 * (ch0[i] + ch1[i]);
+  }
+
+  const sr = audioBuffer.sampleRate;
+
+  // 2) downsample lineal simple si hace falta
+  let s = mono, srs = sr;
+  if (sr > downsampleTo) {
+    const ratio = sr / downsampleTo;
+    const newLen = Math.floor(mono.length / ratio);
+    const out = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      out[i] = mono[Math.floor(i * ratio)] || 0;
+    }
+    s = out; srs = downsampleTo;
+  }
+
+  // 3) onsets
+  const onsets = detectOnsetsMono(s, srs, 512, 2048);
+
+  // 4) pitch por segmentos (toma mediana de pitches válidos)
+  const notesOut = [];
+  const segs = [...onsets, (s.length / srs)]; // último punto: final
+  for (let k = 0; k < segs.length - 1; k++) {
+    const t0 = segs[k], t1 = segs[k+1];
+    const i0 = Math.floor(t0 * srs);
+    const i1 = Math.max(i0 + win, Math.floor(t1 * srs)); // asegúrate de tamaño mínimo
+
+    const pitches = [];
+    for (let i = i0; i + win <= i1; i += hop) {
+      const frame = s.subarray(i, i + win);
+      const f0 = yinPitch(frame, srs, yinThresh);
+      if (f0 && f0 >= 60 && f0 <= 1500) pitches.push(f0);
+    }
+
+    if (pitches.length) {
+      // mediana para estabilidad
+      pitches.sort((a,b) => a-b);
+      const med = pitches[(pitches.length/2)|0];
+      const midi = midiFromFreq(med);
+      const name = nameFromMidi(midi);
+
+      notesOut.push({
+        note: name,
+        start: t0,
+        dur: Math.max(0.08, t1 - t0),
+        freq: med,
+        midi
+      });
+    }
+  }
+  return notesOut;
+}
+
+// === Estimación de BPM (opcional, muy simple) desde envolvente de onset ===
+function estimateBPMFromOnsets(onsets) {
+  if (!onsets || onsets.length < 4) return 100;
+  const intervals = [];
+  for (let i = 1; i < onsets.length; i++) intervals.push(onsets[i] - onsets[i-1]);
+  const med = intervals.sort((a,b)=>a-b)[(intervals.length/2)|0];
+  const bpm = Math.round(60 / Math.max(med, 1e-3));
+  // clamp razonable
+  return Math.max(60, Math.min(180, bpm));
+}
+
+
+function CanvasRig({
+  instanceIndex,
+  onRemove,
+  canRemove,
+  preset,
+  durationSec = 8,
+  onDurationChange,
+  shouldAutoRun = false,
+  autoPlayEnabled = false,
+  themeKey = "midnight",
+  performanceMode = false,
+}) {
   // --- Canvas / Phys ---
+  const [selectedSongKey, setSelectedSongKey] = useState("sevenNation");
+
+  // --- Tamaño del canvas redimensionable ---
+const [canvasSize, setCanvasSize] = useState({ w: 900, h: 420 }); // tamaño inicial
+const canvasWrapRef = useRef(null);
+const resizingRef = useRef(null); // { startX, startY, startW, startH }
+  useEffect(() => {
+    needsRedrawRef.current = true;
+  }, [canvasSize]);
+
+
   const canvasRef = useRef(null);
   const rafRef = useRef(null);
   const lastTRef = useRef(0);
   const pairsCooldown = useRef(new Map());
 
   // --- Audio ---
-  const [audioReady, setAudioReady] = useState(false);
   const audioRef = useRef(null);
 
   // Grabación (opcional)
   const mediaRecorderRef = useRef(null);
   const [isRecording, setIsRecording] = useState(false);
   const recordedChunksRef = useRef([]);
+  const [flashAlpha, setFlashAlpha] = useState(0);
 
   // Transporte
   const [isRunning, setIsRunning] = useState(false);
-  const [bpm, setBpm] = useState(100);
+  const isRunningRef = useRef(isRunning);
+  useEffect(() => {
+    isRunningRef.current = isRunning;
+    needsRedrawRef.current = true;
+  }, [isRunning]);
+  const [bpm, setBpm] = useState(preset?.bpm ?? 100);
   const [quant, setQuant] = useState(1 / 8);
 
-  
-
   // Estado de bolas (con name)
+  const palette = useMemo(() => getThemePalette(themeKey), [themeKey]);
   const [balls, setBalls] = useState(() =>
-    Array.from({ length: 5 }).map((_, i) => ({
-      id: i + 1,
-      name: `Bola ${i + 1}`, // <- nuevo campo
-      x: rnd(100, 500),
-      y: rnd(80, 300),
-      vx: rnd(-120, 120),
-      vy: rnd(-120, 120),
-      r: rnd(10, 16),
-      color: `hsl(${Math.floor(rnd(0, 360))} 80% 60%)`,
-      voice: VOICES[i % VOICES.length].value,
-    }))
+    preset?.balls
+      ? applyThemeToBalls(preset.balls.map((ball, idx) => ({ ...ball, id: idx + 1 })), palette)
+      : applyThemeToBalls(
+          Array.from({ length: 5 }).map((_, i) => ({
+            id: i + 1,
+            name: `Bola ${i + 1}`,
+            x: rnd(100, 500),
+            y: rnd(80, 300),
+            vx: rnd(-120, 120),
+            vy: rnd(-120, 120),
+            r: rnd(10, 16),
+            color: `hsl(${Math.floor(rnd(0, 360))} 80% 60%)`,
+            voice: VOICES[i % VOICES.length].value,
+            type: "note",
+            isNote: true,
+            note: "A4",
+            tempoQuant: 1 / 8,
+            velocity: 1.0,
+          })),
+          palette
+        )
   );
+  const ballsRef = useRef([]);
+  const needsRedrawRef = useRef(true);
+  useEffect(() => {
+    ballsRef.current = balls.map((b) => ({ ...b }));
+    needsRedrawRef.current = true;
+  }, [balls]);
+
+  const applyBallsUpdate = (updater) => {
+    setBalls((prev) => {
+      const base =
+        typeof updater === "function"
+          ? updater(prev.map((b) => ({ ...b })))
+          : updater.map((b) => ({ ...b }));
+      ballsRef.current = base.map((b) => ({ ...b }));
+      needsRedrawRef.current = true;
+      return base;
+    });
+  };
+  const presetVersionRef = useRef(preset?.version ?? null);
+  useEffect(() => {
+    applyBallsUpdate((prev) => applyThemeToBalls(prev, palette));
+  }, [palette]);
+  useEffect(() => {
+    if (!preset || !preset.version || presetVersionRef.current === preset.version) return;
+    presetVersionRef.current = preset.version;
+    if (Array.isArray(preset.balls)) {
+      applyBallsUpdate(preset.balls.map((ball, idx) => ({ ...ball, id: idx + 1 })));
+    }
+    if (preset.bpm) setBpm(preset.bpm);
+    ensureAudio();
+    const autoStart = autoPlayEnabled ? shouldAutoRun : false;
+    setIsRunning(autoStart);
+  }, [preset, autoPlayEnabled, shouldAutoRun]);
+
+  // sincroniza con auto-play
+  useEffect(() => {
+    if (!autoPlayEnabled) return;
+    if (shouldAutoRun) {
+      ensureAudio();
+      setIsRunning(true);
+    } else {
+      setIsRunning(false);
+    }
+  }, [shouldAutoRun, autoPlayEnabled]);
+
+  useEffect(() => {
+    if (!shouldAutoRun) return;
+    setFlashAlpha(0.6);
+  }, [shouldAutoRun]);
+
+  useEffect(() => {
+    if (flashAlpha <= 0) return;
+    const id = requestAnimationFrame(() =>
+      setFlashAlpha((prev) => (prev <= 0.02 ? 0 : prev - 0.04))
+    );
+    return () => cancelAnimationFrame(id);
+  }, [flashAlpha]);
 
   // --- Interacción pointer (drag & flick) ---
   const draggingIdRef = useRef(null);
@@ -259,7 +1284,6 @@ export default function Rapsody() {
   const pointerHistoryRef = useRef([]);
 
   const MAX_SPEED = 260;
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   function getPointer(evt, canvas) {
     const rect = canvas.getBoundingClientRect();
     const x = (evt.clientX - rect.left) * window.devicePixelRatio;
@@ -277,7 +1301,7 @@ export default function Rapsody() {
 
   // Audio ensure
   const ensureAudio = () => {
-    if (!audioRef.current) audioRef.current = createAudio();
+    if (!audioRef.current) audioRef.current = getSharedAudio();
     if (audioRef.current.ctx.state !== "running") audioRef.current.ctx.resume();
 
     // MediaRecorder init una vez
@@ -305,52 +1329,79 @@ export default function Rapsody() {
         console.warn("MediaRecorder no disponible:", err);
       }
     }
-    setAudioReady(true);
   };
 
-  const trigger = (voice) => {
+  const triggerCombo = useCallback((tempoBall, noteBall) => {
     if (!audioRef.current) return;
-    const { ctx, voices } = audioRef.current;
+    const { ctx, playNoteByName } = audioRef.current;
+  
+    // cuantización: usa la del tempoBall si está, si no la global
+    const sub = tempoBall?.tempoQuant || quant;
     const t = ctx.currentTime + 0.03;
-    const qt = nextQuantizedTime(t, bpm, quant * 4);
-    (voices[voice] || voices.kick)(qt);
-  };
+    const qt = nextQuantizedTime(t, bpm, sub * 4);
+  
+    const vel = Math.max(0.1, Math.min(1.5, tempoBall?.velocity ?? 1.0));
+    // Por ahora siempre nota (piano sintético):
+    playNoteByName(noteBall.note, qt, vel);
+    const midi = midiFromNoteName(noteBall.note);
+    const freq = freqFromMidi(midi);
+    audioRef.current.voices?.pad?.(qt, freq);
+    audioRef.current.voices?.bass?.(qt, freq / 2);
+  }, [bpm, quant]);
+  const triggerComboRef = useRef(triggerCombo);
+  useEffect(() => { triggerComboRef.current = triggerCombo; }, [triggerCombo]);
 
   // Física + dibujo + eventos pointer
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    let width = (canvas.width = canvas.clientWidth * window.devicePixelRatio);
-    let height = (canvas.height = canvas.clientHeight * window.devicePixelRatio);
-
-    const onResize = () => {
-      width = canvas.width = canvas.clientWidth * window.devicePixelRatio;
-      height = canvas.height = canvas.clientHeight * window.devicePixelRatio;
+    let width = 0;
+    let height = 0;
+    const dpr = window.devicePixelRatio || 1;
+    const resizeBacking = () => {
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      const targetW = Math.max(1, Math.floor(cssW * dpr));
+      const targetH = Math.max(1, Math.floor(cssH * dpr));
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      width = canvas.width;
+      height = canvas.height;
+      needsRedrawRef.current = true;
     };
+    resizeBacking();
+    let ro;
+    if (canvasWrapRef.current) {
+      ro = new ResizeObserver(() => resizeBacking());
+      ro.observe(canvasWrapRef.current);
+    }
+    const onResize = () => resizeBacking();
     window.addEventListener("resize", onResize);
+    const onDPRChange = () => resizeBacking();
+    const mm = window.matchMedia?.(`(resolution: ${dpr}dppx)`);
+    mm?.addEventListener?.("change", onDPRChange);
 
-    // --- Eventos pointer (drag & flick) ---
     const onPointerDown = (e) => {
       const p = getPointer(e, canvas);
       lastPtrRef.current = p;
       pointerHistoryRef.current = [p];
-
-      let hit = null, hitIdx = -1;
-      setBalls((prev) => {
+      let hit = null;
+      applyBallsUpdate((prev) => {
         const arr = prev.map((b) => ({ ...b }));
         const [b, idx] = findBallAt(p.x, p.y, arr);
-        hit = b; hitIdx = idx;
-        if (b) {
+        hit = b;
+        if (b && idx >= 0) {
           draggingIdRef.current = b.id;
           dragOffsetRef.current = { x: p.x - b.x, y: p.y - b.y };
           showArrowRef.current = { x: p.x, y: p.y };
-          // parar mientras arrastras
-          arr[idx].vx = 0; arr[idx].vy = 0;
+          arr[idx].vx = 0;
+          arr[idx].vy = 0;
         }
         return arr;
       });
-
       if (hit) {
         canvas.setPointerCapture?.(e.pointerId);
         e.preventDefault();
@@ -362,8 +1413,7 @@ export default function Rapsody() {
       const p = getPointer(e, canvas);
       const id = draggingIdRef.current;
       const off = dragOffsetRef.current;
-
-      setBalls((prev) => {
+      applyBallsUpdate((prev) => {
         const arr = prev.map((b) => ({ ...b }));
         const i = arr.findIndex((b) => b.id === id);
         if (i >= 0) {
@@ -372,71 +1422,55 @@ export default function Rapsody() {
         }
         return arr;
       });
-
       showArrowRef.current = { x: p.x, y: p.y };
       lastPtrRef.current = p;
-pointerHistoryRef.current.push(p);
-const cutoff = p.t - 120; // ms
-pointerHistoryRef.current = pointerHistoryRef.current.filter(pt => pt.t >= cutoff);
-if (pointerHistoryRef.current.length > 12) {
-  pointerHistoryRef.current.shift();
-}
-
+      pointerHistoryRef.current.push(p);
+      const cutoff = p.t - 120;
+      pointerHistoryRef.current = pointerHistoryRef.current.filter((pt) => pt.t >= cutoff);
+      if (pointerHistoryRef.current.length > 12) pointerHistoryRef.current.shift();
     };
 
     const onPointerUp = (e) => {
       if (!draggingIdRef.current) return;
-      const p = getPointer(e, canvas);
       const id = draggingIdRef.current;
-
-      // NUEVO: velocidad basada en historial de ~50–100 ms (flick real)
-const hist = pointerHistoryRef.current;
-if (hist.length >= 2) {
-  const pNow = hist[hist.length - 1];
-  // busca una muestra ~60 ms atrás; si no hay, usa la más antigua
-  let pPast = hist[0];
-  for (let i = hist.length - 1; i >= 0; i--) {
-    if (pNow.t - hist[i].t >= 60) { // 60 ms ventana objetivo
-      pPast = hist[i];
-      break;
-    }
-  }
-
-  const dt = Math.max((pNow.t - pPast.t) / 1000, 1 / 240);
-  const vxRaw = (pNow.x - pPast.x) / dt;
-  const vyRaw = (pNow.y - pPast.y) / dt;
-
-  const mag = Math.hypot(vxRaw, vyRaw) || 0;
-  const k = mag > 0 ? Math.min(MAX_SPEED / mag, 1) : 0;
-  const vx = vxRaw * k;
-  const vy = vyRaw * k;
-
-  setBalls((prevBalls) => {
-    const arr = prevBalls.map((b) => ({ ...b }));
-    const i = arr.findIndex((b) => b.id === id);
-    if (i >= 0) {
-      arr[i].vx = vx;
-      arr[i].vy = vy;
-    }
-    return arr;
-  });
-} else {
-  // sin historial suficiente: no “lanzamos”
-  setBalls((prevBalls) => {
-    const arr = prevBalls.map((b) => ({ ...b }));
-    const i = arr.findIndex((b) => b.id === id);
-    if (i >= 0) {
-      arr[i].vx = 0;
-      arr[i].vy = 0;
-    }
-    return arr;
-  });
-}
-
-// limpiar historial
-pointerHistoryRef.current = [];
-
-
+      const hist = pointerHistoryRef.current;
+      if (hist.length >= 2) {
+        const pNow = hist[hist.length - 1];
+        let pPast = hist[0];
+        for (let i = hist.length - 1; i >= 0; i--) {
+          if (pNow.t - hist[i].t >= 60) {
+            pPast = hist[i];
+            break;
+          }
+        }
+        const dt = Math.max((pNow.t - pPast.t) / 1000, 1 / 240);
+        const vxRaw = (pNow.x - pPast.x) / dt;
+        const vyRaw = (pNow.y - pPast.y) / dt;
+        const mag = Math.hypot(vxRaw, vyRaw) || 0;
+        const k = mag > 0 ? Math.min(MAX_SPEED / mag, 1) : 0;
+        const vx = vxRaw * k;
+        const vy = vyRaw * k;
+        applyBallsUpdate((prevBalls) => {
+          const arr = prevBalls.map((b) => ({ ...b }));
+          const i = arr.findIndex((b) => b.id === id);
+          if (i >= 0) {
+            arr[i].vx = vx;
+            arr[i].vy = vy;
+          }
+          return arr;
+        });
+      } else {
+        applyBallsUpdate((prevBalls) => {
+          const arr = prevBalls.map((b) => ({ ...b }));
+          const i = arr.findIndex((b) => b.id === id);
+          if (i >= 0) {
+            arr[i].vx = 0;
+            arr[i].vy = 0;
+          }
+          return arr;
+        });
+      }
+      pointerHistoryRef.current = [];
       draggingIdRef.current = null;
       showArrowRef.current = null;
       canvas.releasePointerCapture?.(e.pointerId);
@@ -450,117 +1484,143 @@ pointerHistoryRef.current = [];
     const step = (t) => {
       const prev = lastTRef.current || t;
       let dt = (t - prev) / 1000;
+      if (!isFinite(dt) || dt < 0) dt = 0;
       if (dt > 0.05) dt = 0.05;
       lastTRef.current = t;
-
-      if (isRunning) {
-        setBalls((prevBalls) => {
-          const arr = prevBalls.map((b) => ({ ...b }));
-
-          // mover
-          for (const b of arr) {
-            b.x += b.vx * dt;
-            b.y += b.vy * dt;
-
-            // paredes
-            if (b.x - b.r < 0) { b.x = b.r; b.vx = Math.abs(b.vx); }
-            else if (b.x + b.r > width) { b.x = width - b.r; b.vx = -Math.abs(b.vx); }
-            if (b.y - b.r < 0) { b.y = b.r; b.vy = Math.abs(b.vy); }
-            else if (b.y + b.r > height) { b.y = height - b.r; b.vy = -Math.abs(b.vy); }
-          }
-
-          // colisiones O(n^2)
-          for (let i = 0; i < arr.length; i++) {
-            for (let j = i + 1; j < arr.length; j++) {
-              const a = arr[i], b = arr[j];
-              const dx = b.x - a.x, dy = b.y - a.y;
-              const dist = Math.hypot(dx, dy), minD = a.r + b.r;
-              if (dist < minD) {
-                // cooldown por par
-                const key = `${a.id}-${b.id}`;
-                const now = performance.now();
-                const last = pairsCooldown.current.get(key) || 0;
-                if (now - last > 80) {
-                  pairsCooldown.current.set(key, now);
-                  trigger(a.voice);
-                }
-                // respuesta elástica simple
-                const overlap = minD - dist || 0.01;
-                const nx = dx / (dist || 1), ny = dy / (dist || 1);
-                a.x -= nx * overlap * 0.5; a.y -= ny * overlap * 0.5;
-                b.x += nx * overlap * 0.5; b.y += ny * overlap * 0.5;
-
-                const avn = a.vx * nx + a.vy * ny;
-                const bvn = b.vx * nx + b.vy * ny;
-                const swap = bvn - avn;
-                a.vx += nx * swap; a.vy += ny * swap;
-                b.vx -= nx * swap; b.vy -= ny * swap;
+      const arr = ballsRef.current;
+      const shouldSimulate = isRunningRef.current;
+      if (shouldSimulate) {
+        for (const b of arr) {
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+          if (b.x - b.r < 0) { b.x = b.r; b.vx = Math.abs(b.vx); }
+          else if (b.x + b.r > width) { b.x = width - b.r; b.vx = -Math.abs(b.vx); }
+          if (b.y - b.r < 0) { b.y = b.r; b.vy = Math.abs(b.vy); }
+          else if (b.y + b.r > height) { b.y = height - b.r; b.vy = -Math.abs(b.vy); }
+        }
+        for (let i = 0; i < arr.length; i++) {
+          for (let j = i + 1; j < arr.length; j++) {
+            if (performanceMode && ((i + j) % 2 === 1)) continue;
+            const a = arr[i], b = arr[j];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const dist = Math.hypot(dx, dy);
+            const minD = a.r + b.r;
+            if (dist < minD) {
+              const key = `${a.id}-${b.id}`;
+              const now = t;
+              const last = pairsCooldown.current.get(key) || 0;
+              if (now - last > 80) {
+                pairsCooldown.current.set(key, now);
+                const aIsTempo = a.type === "tempo";
+                const bIsTempo = b.type === "tempo";
+                const aIsNote = a.type === "note";
+                const bIsNote = b.type === "note";
+                if (aIsTempo && bIsNote) triggerComboRef.current?.(a, b);
+                else if (bIsTempo && aIsNote) triggerComboRef.current?.(b, a);
               }
+              const overlap = minD - dist || 0.01;
+              const nx = dx / (dist || 1);
+              const ny = dy / (dist || 1);
+              a.x -= nx * overlap * 0.5; a.y -= ny * overlap * 0.5;
+              b.x += nx * overlap * 0.5; b.y += ny * overlap * 0.5;
+              const avn = a.vx * nx + a.vy * ny;
+              const bvn = b.vx * nx + b.vy * ny;
+              const swap = bvn - avn;
+              a.vx += nx * swap; a.vy += ny * swap;
+              b.vx -= nx * swap; b.vy -= ny * swap;
             }
           }
-          return arr;
-        });
+        }
+        needsRedrawRef.current = true;
       }
-
-      // dibujar
-      ctx.clearRect(0, 0, width, height);
-      for (const b of balls) {
-        ctx.beginPath();
-        ctx.fillStyle = b.color;
-        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // flecha mientras arrastras
-      if (showArrowRef.current && draggingIdRef.current) {
-        const id = draggingIdRef.current;
-        const b = balls.find((bb) => bb.id === id);
-        if (b) {
-          const tip = showArrowRef.current;
-          const fromX = b.x, fromY = b.y;
-          const toX = tip.x - dragOffsetRef.current.x;
-          const toY = tip.y - dragOffsetRef.current.y;
-
-          ctx.save();
-          ctx.strokeStyle = "#22d3ee";
-          ctx.lineWidth = 2 * window.devicePixelRatio;
+      const shouldDraw = needsRedrawRef.current || shouldSimulate || draggingIdRef.current;
+      if (shouldDraw) {
+        needsRedrawRef.current = false;
+        ctx.clearRect(0, 0, width, height);
+        ctx.save();
+        const bg = palette.bg || DEFAULT_BG;
+        ctx.fillStyle = `hsl(${bg} / 0.12)`;
+        ctx.fillRect(0, 0, width, height);
+        ctx.restore();
+        for (const b of arr) {
           ctx.beginPath();
-          ctx.moveTo(fromX, fromY);
-          ctx.lineTo(toX, toY);
-          ctx.stroke();
-
-          const ang = Math.atan2(toY - fromY, toX - fromX);
-          const ah = 10 * window.devicePixelRatio;
-          ctx.beginPath();
-          ctx.moveTo(toX, toY);
-          ctx.lineTo(toX - ah * Math.cos(ang - Math.PI / 6), toY - ah * Math.sin(ang - Math.PI / 6));
-          ctx.lineTo(toX - ah * Math.cos(ang + Math.PI / 6), toY - ah * Math.sin(ang + Math.PI / 6));
-          ctx.closePath();
-          ctx.fillStyle = "#22d3ee";
+          ctx.fillStyle = b.color;
+          ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
           ctx.fill();
-          ctx.restore();
+        }
+        if (showArrowRef.current && draggingIdRef.current && !(performanceMode && !shouldSimulate)) {
+          const id = draggingIdRef.current;
+          const b = arr.find((bb) => bb.id === id);
+          if (b) {
+            const tip = showArrowRef.current;
+            const fromX = b.x, fromY = b.y;
+            const toX = tip.x - dragOffsetRef.current.x;
+            const toY = tip.y - dragOffsetRef.current.y;
+            ctx.save();
+            ctx.strokeStyle = "#22d3ee";
+            ctx.lineWidth = 2 * window.devicePixelRatio;
+            ctx.beginPath();
+            ctx.moveTo(fromX, fromY);
+            ctx.lineTo(toX, toY);
+            ctx.stroke();
+            const ang = Math.atan2(toY - fromY, toX - fromX);
+            const ah = 10 * window.devicePixelRatio;
+            ctx.beginPath();
+            ctx.moveTo(toX, toY);
+            ctx.lineTo(toX - ah * Math.cos(ang - Math.PI / 6), toY - ah * Math.sin(ang - Math.PI / 6));
+            ctx.lineTo(toX - ah * Math.cos(ang + Math.PI / 6), toY - ah * Math.sin(ang + Math.PI / 6));
+            ctx.closePath();
+            ctx.fillStyle = "#22d3ee";
+            ctx.fill();
+            ctx.restore();
+          }
         }
       }
-
       rafRef.current = requestAnimationFrame(step);
     };
-
     rafRef.current = requestAnimationFrame(step);
     return () => {
       cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
+      mm?.removeEventListener?.("change", onDPRChange);
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointercancel", onPointerUp);
+      ro?.disconnect();
     };
-  }, [isRunning, balls, bpm, quant]);
+  }, [performanceMode, palette]);
+
+
+
+const loadSongPreset = (key, palette) => {
+  const preset = SONG_PRESETS[key];
+  if (!preset) return;
+
+  const areaW = canvasWrapRef.current?.clientWidth || canvasSize.w || 900;
+  const areaH = canvasWrapRef.current?.clientHeight || canvasSize.h || 420;
+
+  const { balls: builtBalls, bpm: newBpm } = buildSequencePreset({
+    notes: preset.notes,
+    tempos: preset.tempos,
+    bpm: preset.bpm,
+    areaW, areaH,
+  });
+  const newBalls = applyThemeToBalls(builtBalls, palette);
+
+  setBpm(newBpm);
+  applyBallsUpdate(newBalls);
+
+  ensureAudio();
+  setIsRunning(true);
+};
+
+
 
   // --- Helpers UI ---
-  const addBall = () => {
+  const addNoteBall = () => {
     const id = (balls.at(-1)?.id || 0) + 1;
-    const voice = VOICES[Math.floor(rnd(0, VOICES.length))].value;
-    const b = {
+    applyBallsUpdate((arr) => [...arr, {
       id,
       name: `Bola ${id}`,
       x: rnd(50, (canvasRef.current?.clientWidth || 640) - 50),
@@ -568,18 +1628,67 @@ pointerHistoryRef.current = [];
       vx: rnd(-160, 160),
       vy: rnd(-160, 160),
       r: rnd(10, 16),
-      color: `hsl(${Math.floor(rnd(0, 360))} 85% 60%)`,
-      voice,
-    };
-    setBalls((arr) => [...arr, b]);
+      color: palette.note(arr.length),
+      voice: VOICES[Math.floor(rnd(0, VOICES.length))].value,
+      type: "note",
+      isNote: true,
+      note: "A4",
+      tempoQuant: 1/8,
+      velocity: 1.0,
+    }]);
   };
-  const removeBall = () => setBalls((arr) => arr.slice(0, -1));
-  const updateBallVoice = (id, voice) =>
-    setBalls((arr) => arr.map((b) => (b.id === id ? { ...b, voice } : b)));
+  
+  const addTempoBall = () => {
+    const id = (balls.at(-1)?.id || 0) + 1;
+    applyBallsUpdate((arr) => [...arr, {
+      id,
+      name: `Tempo ${id}`,
+      x: rnd(50, (canvasRef.current?.clientWidth || 640) - 50),
+      y: rnd(50, (canvasRef.current?.clientHeight || 360) - 50),
+      vx: rnd(-160, 160),
+      vy: rnd(-160, 160),
+      r: rnd(10, 16),
+      color: palette.tempo(arr.length),
+      voice: "blip",
+      type: "tempo",
+      isNote: false,
+      note: "A4",
+      tempoQuant: 1/8,
+      velocity: 1.0,
+    }]);
+  };
+  
+
+
+  const removeBall = () => applyBallsUpdate((arr) => arr.slice(0, -1));
   const updateBallName = (id, name) =>
-    setBalls((arr) => arr.map((b) => (b.id === id ? { ...b, name } : b)));
+    applyBallsUpdate((arr) => arr.map((b) => (b.id === id ? { ...b, name } : b)));
+  
+  const updateBallNote = (id, note) =>
+    applyBallsUpdate((arr) => arr.map((b) => (b.id === id ? { ...b, note } : b)));
+
+  const updateBallType = (id, type) =>
+    applyBallsUpdate((arr) => arr.map((b) => b.id === id
+      ? {
+          ...b,
+          type,
+          isNote: type === "note",
+          color: type === "note"
+            ? palette.note(id)
+            : palette.tempo(id),
+        }
+      : b
+    ));
+  
+  const updateBallTempoQuant = (id, q) =>
+    applyBallsUpdate((arr) => arr.map((b) => b.id === id ? { ...b, tempoQuant: q } : b));
+  
+  const updateBallVelocity = (id, v) =>
+    applyBallsUpdate((arr) => arr.map((b) => b.id === id ? { ...b, velocity: v } : b));
+  
+  
   const nudgeEnergy = (scale = 1.1) =>
-    setBalls((arr) => arr.map((b) => ({ ...b, vx: b.vx * scale, vy: b.vy * scale })));
+    applyBallsUpdate((arr) => arr.map((b) => ({ ...b, vx: b.vx * scale, vy: b.vy * scale })));
 
   // Presets
   const savePreset = () => {
@@ -593,7 +1702,7 @@ pointerHistoryRef.current = [];
       const data = JSON.parse(raw);
       if (data?.bpm) setBpm(data.bpm);
       if (data?.quant) setQuant(data.quant);
-      if (Array.isArray(data?.balls)) setBalls(data.balls);
+      if (Array.isArray(data?.balls)) applyBallsUpdate(applyThemeToBalls(data.balls, palette));
     } catch (e) {
       console.warn("Preset inválido", e);
     }
@@ -614,9 +1723,36 @@ pointerHistoryRef.current = [];
     }
   };
 
+  const displayTitle = preset?.label || `Canvas #${instanceIndex + 1}`;
+
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 p-4">
+    <section className="rounded-3xl bg-slate-900/80 text-slate-100 p-4 ring-1 ring-slate-800 shadow-xl">
       <header className="flex flex-wrap gap-2 mb-4 items-center">
+        <div className="flex items-center gap-2 pr-4 border-r border-slate-700 mb-2 sm:mb-0">
+          <h2 className="text-lg font-semibold tracking-wide text-slate-100">
+            {displayTitle}
+          </h2>
+          {canRemove && (
+            <button
+              onClick={onRemove}
+              className="px-3 py-1 rounded-2xl bg-rose-600 hover:bg-rose-700 text-sm"
+            >
+              Cerrar
+            </button>
+          )}
+        </div>
+        <label className="flex items-center gap-2 text-sm text-slate-300">
+          Duración (s)
+          <input
+            type="number"
+            min={3}
+            max={120}
+            step={1}
+            value={durationSec}
+            onChange={(e) => onDurationChange?.(Number(e.target.value) || 8)}
+            className="bg-slate-800 rounded-xl px-2 py-1 w-20 text-right"
+          />
+        </label>
         <button
           onClick={() => { ensureAudio(); setIsRunning((v) => !v); }}
           className={`px-4 py-2 rounded-2xl shadow-sm transition ${
@@ -640,15 +1776,7 @@ pointerHistoryRef.current = [];
 
         <label className="flex items-center gap-3">
           <span className="text-sm text-slate-300">Cuantización</span>
-          <select
-            value={quant}
-            onChange={(e) => setQuant(parseFloat(e.target.value))}
-            className="bg-slate-700 rounded-xl px-2 py-1"
-          >
-            {QUANT_OPTIONS.map((q) => (
-              <option key={q.value} value={q.value}>{q.label}</option>
-            ))}
-          </select>
+          
         </label>
 
         <button
@@ -664,9 +1792,13 @@ pointerHistoryRef.current = [];
           Energía –
         </button>
 
-        <button onClick={addBall} className="px-4 py-2 rounded-2xl bg-violet-500 hover:bg-violet-600">
-          Añadir bola
-        </button>
+        <button onClick={addNoteBall} className="px-4 py-2 rounded-2xl bg-violet-500 hover:bg-violet-600">
+  Añadir bola (Nota)
+</button>
+<button onClick={addTempoBall} className="px-4 py-2 rounded-2xl bg-cyan-500 hover:bg-cyan-600">
+  Añadir bola (Tempo)
+</button>
+
         <button
           onClick={removeBall}
           disabled={balls.length <= 1}
@@ -691,12 +1823,98 @@ pointerHistoryRef.current = [];
         >
           {isRecording ? "Grabando…" : "Grabar .webm"}
         </button>
+
+        {/* -------- Presets de Canciones -------- */}
+<div className="flex items-center gap-2 ml-2">
+  <label className="text-sm text-slate-300">Canción</label>
+  <select
+    value={selectedSongKey}
+    onChange={(e) => setSelectedSongKey(e.target.value)}
+    className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+    title="Selecciona un preset de canción"
+  >
+    {Object.entries(SONG_PRESETS).map(([k, v]) => (
+      <option key={k} value={k}>{v.label}</option>
+    ))}
+  </select>
+  <button
+    onClick={() => loadSongPreset(selectedSongKey, palette)}
+    className="px-3 py-2 rounded-2xl bg-pink-500 hover:bg-pink-600"
+    title="Cargar la configuración de bolas para esta canción"
+  >
+    Cargar canción
+  </button>
+</div>
+
+
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <div className="lg:col-span-3 rounded-3xl overflow-hidden bg-slate-800 ring-1 ring-slate-700">
-          <canvas ref={canvasRef} className="h-[420px] w-full" />
-        </div>
+      <div className="lg:col-span-3">
+  <div
+    ref={canvasWrapRef}
+    className="relative rounded-3xl ring-1 ring-slate-700 overflow-hidden select-none"
+    style={{
+      width: `${canvasSize.w}px`,
+      height: `${canvasSize.h}px`,
+      background: `hsl(${palette.bg || DEFAULT_BG} / 0.08)`,
+    }}
+  >
+    <canvas ref={canvasRef} className="w-full h-full block" />
+    {flashAlpha > 0 && (
+      <div
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background: `rgba(255,255,255,${flashAlpha})`,
+          mixBlendMode: "screen",
+        }}
+      />
+    )}
+
+    {/* Tirador esquina inferior-derecha */}
+    <div
+      onPointerDown={(e) => {
+        e.preventDefault();
+        const rect = canvasWrapRef.current.getBoundingClientRect();
+        resizingRef.current = {
+          startX: e.clientX,
+          startY: e.clientY,
+          startW: rect.width,
+          startH: rect.height,
+        };
+        // captura el puntero en el handle
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      }}
+      onPointerMove={(e) => {
+        if (!resizingRef.current) return;
+        const { startX, startY, startW, startH } = resizingRef.current;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+
+        // límites mínimos/máximos
+        const minW = 360, minH = 240;
+        const maxW = 1600, maxH = 1000;
+
+        const newW = Math.max(minW, Math.min(maxW, Math.round(startW + dx)));
+        const newH = Math.max(minH, Math.min(maxH, Math.round(startH + dy)));
+
+        setCanvasSize({ w: newW, h: newH });
+      }}
+      onPointerUp={(e) => {
+        resizingRef.current = null;
+        e.currentTarget.releasePointerCapture?.(e.pointerId);
+      }}
+      className="absolute bottom-1.5 right-1.5 h-4 w-4 cursor-nwse-resize rounded-md"
+      style={{
+        // un pequeño grip visual
+        background:
+          "linear-gradient(135deg, transparent 0 40%, rgba(255,255,255,.25) 40% 60%, transparent 60% 100%)",
+      }}
+      title="Arrastra para redimensionar"
+    />
+  </div>
+</div>
+
 
         {/* Lista desplazable de bolas */}
         <aside className="lg:col-span-1">
@@ -704,7 +1922,7 @@ pointerHistoryRef.current = [];
             <div className="sticky top-0 z-10 bg-slate-900/80 backdrop-blur px-4 py-2 text-xs text-slate-400">
               Bolas e instrumentos
             </div>
-            <div className="space-y-2 max-h-[420px] overflow-y-auto pr-2 p-3" role="list" aria-label="Bolas e instrumentos">
+            <div className="space-y-2 overflow-y-auto pr-2 p-3" style={{ maxHeight: `${canvasSize.h}px` }} role="list" aria-label="Bolas e instrumentos">
               {balls.map((b) => (
                 <div key={b.id} className="flex items-center gap-3 bg-slate-900/40 rounded-xl p-2">
                   <span className="inline-block h-3 w-3 rounded-full" style={{ background: b.color }} />
@@ -715,20 +1933,361 @@ pointerHistoryRef.current = [];
                     className="bg-slate-700 rounded px-2 py-1 text-sm text-slate-100 flex-1 min-w-0"
                     placeholder={`Bola ${b.id}`}
                   />
-                  <select
-                    value={b.voice}
-                    onChange={(e) => updateBallVoice(b.id, e.target.value)}
-                    className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
-                  >
-                    {VOICES.map((v) => (
-                      <option key={v.value} value={v.value}>{v.label}</option>
-                    ))}
-                  </select>
+{/* Tipo de bola */}
+<select
+  value={b.type}
+  onChange={(e) => updateBallType(b.id, e.target.value)}
+  className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+>
+  <option value="note">Nota</option>
+  <option value="tempo">Tempo</option>
+</select>
+
+{/* Config según tipo */}
+{b.type === "note" ? (
+  <select
+    value={b.note}
+    onChange={(e) => updateBallNote(b.id, e.target.value)}
+    className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+  >
+    {NOTE_NAMES_88.map((n) => (
+      <option key={n} value={n}>{n}</option>
+    ))}
+  </select>
+) : (
+  <div className="flex items-center gap-2">
+    <select
+      value={b.tempoQuant}
+      onChange={(e) => updateBallTempoQuant(b.id, parseFloat(e.target.value))}
+      className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+      title="Subdivisión de cuantización para este tempo-ball"
+    >
+      {TEMPO_QUANT_OPTIONS.map((q) => (
+        <option key={q.value} value={q.value}>{q.label}</option>
+      ))}
+    </select>
+    <label className="flex items-center gap-2 text-xs text-slate-300">
+      Vel
+      <input
+        type="range" min={0.3} max={1.5} step={0.05}
+        value={b.velocity ?? 1}
+        onChange={(e) => updateBallVelocity(b.id, parseFloat(e.target.value))}
+      />
+      <span className="w-8 text-right">{(b.velocity ?? 1).toFixed(2)}</span>
+    </label>
+  </div>
+)}
+
+
+
+
                 </div>
               ))}
             </div>
           </div>
         </aside>
+      </div>
+    </section>
+  );
+}
+
+export default function Rapsody() {
+  const [canvasInstances, setCanvasInstances] = useState([{ id: Date.now(), preset: null, durationSec: 8 }]);
+  const [songFile, setSongFile] = useState(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [autoPlay, setAutoPlay] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(null);
+  const autoTimerRef = useRef(null);
+  const [theme, setTheme] = useState("midnight");
+  const [performanceMode, setPerformanceMode] = useState(false);
+  const [fxEnabled, setFxEnabled] = useState(true);
+  const importProjectInputRef = useRef(null);
+
+  const addCanvas = () =>
+    setCanvasInstances((prev) => [
+      ...prev,
+      { id: Date.now() + Math.random(), preset: null, durationSec: 8 },
+    ]);
+
+  const removeCanvas = (id) =>
+    setCanvasInstances((prev) => {
+      const next = prev.length > 1 ? prev.filter((c) => c.id !== id) : prev;
+      if (activeIndex !== null && activeIndex >= next.length) setActiveIndex(next.length - 1);
+      return next;
+    });
+
+  const updateDuration = (id, value) => {
+    setCanvasInstances((prev) =>
+      prev.map((inst) => (inst.id === id ? { ...inst, durationSec: Math.max(3, value || 3) } : inst))
+    );
+  };
+
+  const stopAutoPlay = () => {
+    setAutoPlay(false);
+    setActiveIndex(null);
+    if (autoTimerRef.current) {
+      clearTimeout(autoTimerRef.current);
+      autoTimerRef.current = null;
+    }
+  };
+
+  const startAutoPlay = () => {
+    if (!canvasInstances.length) return;
+    setActiveIndex(0);
+    setAutoPlay(true);
+  };
+
+  const handleExportProject = () => {
+    const payload = {
+      version: 1,
+      theme,
+      performanceMode,
+      fxEnabled,
+      canvasInstances,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rapsody_project_${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportProject = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (Array.isArray(data?.canvasInstances)) setCanvasInstances(data.canvasInstances);
+      if (typeof data?.theme === "string") setTheme(data.theme);
+      if (typeof data?.performanceMode === "boolean") setPerformanceMode(data.performanceMode);
+      if (typeof data?.fxEnabled === "boolean") setFxEnabled(data.fxEnabled);
+    } catch (err) {
+      alert("Archivo de proyecto inválido.");
+      console.error(err);
+    }
+  };
+
+  useEffect(() => {
+    if (!autoPlay || activeIndex === null || !canvasInstances[activeIndex]) return;
+    if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    const durationMs = Math.max(3, canvasInstances[activeIndex].durationSec || 8) * 1000;
+    autoTimerRef.current = setTimeout(() => {
+      setActiveIndex((prev) => {
+        const next = prev + 1;
+        if (next >= canvasInstances.length) {
+          stopAutoPlay();
+          return prev;
+        }
+        return next;
+      });
+    }, durationMs);
+    return () => {
+      if (autoTimerRef.current) {
+        clearTimeout(autoTimerRef.current);
+        autoTimerRef.current = null;
+      }
+    };
+  }, [autoPlay, activeIndex, canvasInstances]);
+
+  useEffect(() => {
+    getSharedAudio().setFxEnabled?.(fxEnabled);
+  }, [fxEnabled]);
+
+  const handleAnalyzeSong = async () => {
+    if (!songFile) {
+      alert("Selecciona un archivo para analizar.");
+      return;
+    }
+    setIsAnalyzing(true);
+    try {
+      const isMidi = /\.mid(i)?$/i.test(songFile.name);
+      const basePreset = isMidi
+        ? await extractPresetFromMidiFile(songFile)
+        : await extractPresetFromAudioFile(songFile);
+      if (!basePreset?.notes?.length) {
+        alert("No pude extraer notas del archivo.");
+        return;
+      }
+      const noteEvents =
+        basePreset.noteEvents && basePreset.noteEvents.length
+          ? basePreset.noteEvents
+          : (basePreset.notes || []).map((name, idx) => ({
+              name,
+              start: idx * 0.5,
+              duration: 0.5,
+              velocity: 0.9,
+            }));
+      const sectionsEvents = splitNotesByMusicalAnalysis(noteEvents, {
+        maxSections: 6,
+        minPerSection: 6,
+      });
+      const fallbackSections = splitNotesIntoSections(basePreset.notes, {
+        maxSections: 5,
+        minPerSection: 6,
+      });
+      const sections = sectionsEvents.length
+        ? sectionsEvents.map((sec) => sec.map((n) => n.name))
+        : fallbackSections;
+      const tempos = (basePreset.tempos && basePreset.tempos.length) ? basePreset.tempos : DEFAULT_TEMPOS;
+      const paletteObj = getThemePalette(theme);
+      const newInstances = sections.map((sectionNotes, idx) => {
+        const tempoVariant = tempos.map((t, k) => ({
+          ...t,
+          angleDeg: (t.angleDeg ?? 0) + idx * 8 * (k % 2 === 0 ? 1 : -1),
+        }));
+        const speedBoost = 1.3 + idx * 0.05;
+        const { balls } = buildSequencePreset({
+          notes: sectionNotes,
+          tempos: tempoVariant,
+          bpm: basePreset.bpm,
+          areaW: 900,
+          areaH: 420,
+        });
+        // Aplica boost de energía inicial (velocidad)
+        balls.forEach((ball) => {
+          ball.vx *= speedBoost;
+          ball.vy *= speedBoost;
+        });
+        const themedBalls = applyThemeToBalls(balls, paletteObj);
+        const estimatedDuration =
+          sectionsEvents[idx]?.reduce?.(
+            (acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)),
+            0
+          ) || Math.max(6, sectionNotes.length * 0.5);
+        return {
+          id: Date.now() + idx + Math.random(),
+          preset: {
+            balls: themedBalls,
+            bpm: basePreset.bpm,
+            label: `${songFile.name} · Sección ${idx + 1}`,
+            version: `${songFile.name}-${Date.now()}-${idx}`,
+          },
+          durationSec: Math.max(3, Math.round(estimatedDuration)),
+        };
+      });
+      setCanvasInstances(
+        newInstances.length ? newInstances : [{ id: Date.now(), preset: null, durationSec: 8 }]
+      );
+      setActiveIndex(0);
+    } catch (err) {
+      console.error("Error al analizar archivo:", err);
+      alert(err?.message ?? "No pude analizar el archivo.");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-4 space-y-6">
+      <section className="rounded-3xl bg-slate-900/80 ring-1 ring-slate-800 p-4 flex flex-wrap gap-3 items-center">
+        <label className="flex flex-col text-sm text-slate-300">
+          Archivo
+          <input
+            type="file"
+            accept=".wav,.mp3,.ogg,.m4a,.flac,.mid,.midi"
+            onChange={(e) => setSongFile(e.target.files?.[0] || null)}
+            className="bg-slate-800 rounded-xl px-3 py-2 mt-1"
+          />
+        </label>
+        <button
+          onClick={handleAnalyzeSong}
+          disabled={!songFile || isAnalyzing}
+          className={`px-4 py-2 rounded-2xl ${isAnalyzing ? "bg-emerald-900 text-slate-400" : "bg-emerald-500 hover:bg-emerald-600"}`}
+        >
+          {isAnalyzing ? "Analizando…" : "Analizar archivo → secciones"}
+        </button>
+        <button
+          onClick={addCanvas}
+          className="px-4 py-2 rounded-2xl bg-indigo-500 hover:bg-indigo-600"
+        >
+          Añadir canvas vacío
+        </button>
+        <label className="flex flex-col text-sm text-slate-300">
+          Tema
+          <select
+            value={theme}
+            onChange={(e) => setTheme(e.target.value)}
+            className="bg-slate-800 rounded-xl px-3 py-2 mt-1"
+          >
+            {Object.entries(THEME_OPTIONS).map(([key, value]) => (
+              <option key={key} value={key}>{value.label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={performanceMode}
+            onChange={(e) => setPerformanceMode(e.target.checked)}
+            className="accent-cyan-500"
+          />
+          Modo rendimiento
+        </label>
+        <label className="flex items-center gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={fxEnabled}
+            onChange={(e) => setFxEnabled(e.target.checked)}
+            className="accent-rose-500"
+          />
+          FX / Reverb
+        </label>
+        <button
+          onClick={handleExportProject}
+          className="px-4 py-2 rounded-2xl bg-amber-500 hover:bg-amber-600"
+        >
+          Exportar proyecto
+        </button>
+        <button
+          onClick={() => importProjectInputRef.current?.click()}
+          className="px-4 py-2 rounded-2xl bg-slate-700 hover:bg-slate-600"
+        >
+          Importar proyecto
+        </button>
+        <input
+          ref={importProjectInputRef}
+          type="file"
+          accept="application/json"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleImportProject(file);
+            e.target.value = "";
+          }}
+        />
+        <button
+          onClick={autoPlay ? stopAutoPlay : startAutoPlay}
+          disabled={!canvasInstances.length}
+          className={`px-4 py-2 rounded-2xl ${
+            autoPlay ? "bg-rose-600 hover:bg-rose-700" : "bg-cyan-500 hover:bg-cyan-600"
+          }`}
+        >
+          {autoPlay ? "Detener secuencia" : "Reproducir secuencial"}
+        </button>
+        <span className="text-sm text-slate-400 ml-auto">
+          {canvasInstances.length} {canvasInstances.length === 1 ? "instancia" : "instancias"} activas
+        </span>
+      </section>
+      <div className="space-y-6">
+        {canvasInstances.map((inst, idx) => (
+          <CanvasRig
+            key={inst.id}
+            instanceIndex={idx}
+            canRemove={canvasInstances.length > 1}
+            onRemove={() => removeCanvas(inst.id)}
+            preset={inst.preset}
+            durationSec={inst.durationSec}
+            onDurationChange={(val) => updateDuration(inst.id, val)}
+            shouldAutoRun={autoPlay && idx === activeIndex}
+            autoPlayEnabled={autoPlay}
+            themeKey={theme}
+            performanceMode={performanceMode}
+          />
+        ))}
       </div>
     </div>
   );
