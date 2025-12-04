@@ -4,7 +4,6 @@ import { Midi } from "@tonejs/midi";
 
 const rnd = (min, max) => Math.random() * (max - min) + min;
 
-// Subdivisiones específicas para bolas de tempo (puedes reutilizar QUANT_OPTIONS)
 const TEMPO_QUANT_OPTIONS = [
   { label: "1/4", value: 1 / 4 },
   { label: "1/8", value: 1 / 8 },
@@ -27,6 +26,131 @@ const DEFAULT_TEMPOS = [
   { quant: 1 / 8, velocity: 1.0, angleDeg: 10, speed: 450 },
   { quant: 1 / 12, velocity: 0.95, angleDeg: -16, speed: 420 },
 ];
+const MELODY_VOICES = [
+  { label: "Piano", value: "piano" },
+  { label: "Pad", value: "pad" },
+  { label: "Bass", value: "bass" },
+  { label: "Blip", value: "blip" },
+];
+const INSTRUMENT_PROFILES = [
+  { voice: "piano", label: "Piano", filter: () => true },
+  { voice: "pad", label: "Pad", filter: () => true },
+  {
+    voice: "bass",
+    label: "Bass",
+    filter: (_, midi) => midi <= 57,
+  },
+  { voice: "blip", label: "Lead", filter: (note, midi) => midi >= 60 },
+];
+const SECTION_SEQUENCE = ["intro", "verse", "chorus", "verse", "chorus", "bridge", "chorus", "outro"];
+const SECTION_PROFILES = {
+  intro: {
+    label: "Intro",
+    percussion: "sparse",
+    conductorDensity: 0.45,
+    padGain: 0.65,
+    octaveShift: -12,
+    chordOctaveShift: -12,
+  },
+  verse: {
+    label: "Verso",
+    percussion: "dembow",
+    conductorDensity: 0.65,
+    padGain: 0.8,
+    octaveShift: -9,
+    chordOctaveShift: -12,
+  },
+  chorus: {
+    label: "Coro",
+    percussion: "full",
+    conductorDensity: 0.9,
+    padGain: 1.0,
+    octaveShift: -7,
+    chordOctaveShift: -11,
+    sustainMultiplier: 1.35,
+  },
+  bridge: {
+    label: "Puente",
+    percussion: "syncopated",
+    conductorDensity: 0.55,
+    padGain: 0.72,
+    octaveShift: -10,
+    chordOctaveShift: -14,
+  },
+  outro: {
+    label: "Outro",
+    percussion: "sparse",
+    conductorDensity: 0.5,
+    padGain: 0.6,
+    octaveShift: -12,
+    chordOctaveShift: -12,
+  },
+};
+const PERCUSSION_PATTERNS = {
+  sparse: {
+    steps: [
+      ["kick"],
+      [],
+      ["hat"],
+      ["snare", "hat"],
+      ["kick"],
+      [],
+      ["hat"],
+      ["snare"],
+    ],
+  },
+  dembow: {
+    steps: [
+      ["kick"],
+      ["hat"],
+      ["snare"],
+      ["hat", "clave"],
+      ["kick"],
+      ["hat"],
+      [],
+      ["snare", "clap", "hat"],
+    ],
+  },
+  full: {
+    steps: [
+      ["kick", "hat"],
+      [],
+      ["hat"],
+      ["snare", "hat"],
+      ["kick"],
+      ["hat"],
+      ["kick"],
+      ["snare", "hat"],
+      ["kick", "hat"],
+      [],
+      ["hat"],
+      ["snare", "clap"],
+      ["kick"],
+      ["hat"],
+      ["kick"],
+      ["snare", "hat", "clave"],
+    ],
+  },
+  syncopated: {
+    steps: [
+      ["kick"],
+      ["hat"],
+      [],
+      ["snare"],
+      ["kick", "clave"],
+      ["hat"],
+      [],
+      ["snare", "hat"],
+    ],
+  },
+};
+const BACKGROUND_VOICE_COLORS = {
+  pad: "rgba(56,189,248,0.55)",
+  bass: "rgba(147,197,253,0.7)",
+  blip: "rgba(248,113,113,0.65)",
+  piano: "rgba(190,242,100,0.65)",
+  default: "rgba(148,163,184,0.6)",
+};
 const THEME_OPTIONS = {
   midnight: {
     label: "Midnight",
@@ -58,6 +182,92 @@ const FLAT_TO_SHARP_MAP = {
   Fb: "E",
 };
 const clampValue = (val, min, max) => Math.max(min, Math.min(max, val));
+const clampMidiValue = (val, min = 28, max = 96) => Math.max(min, Math.min(max, Math.round(val)));
+const getSectionProfileByIndex = (idx = 0) => {
+  const key = SECTION_SEQUENCE[idx % SECTION_SEQUENCE.length] || "verse";
+  const profile = SECTION_PROFILES[key] || SECTION_PROFILES.verse;
+  return { key, ...profile };
+};
+function summarizeSectionEvents(events = []) {
+  if (!events?.length) {
+    return {
+      medianMidi: 60,
+      span: 0,
+      noteDensity: 0,
+      totalTime: 4,
+      accentNotes: [],
+      meanVelocity: 0.8,
+    };
+  }
+  const normalized = events.map((ev, idx) => ({
+    note: normalizeNoteName(ev.note || ev.name || "A4"),
+    start: Number.isFinite(ev.start) ? ev.start : idx * 0.5,
+    duration: Number.isFinite(ev.duration) ? Math.max(0.08, ev.duration) : 0.5,
+    velocity: Number.isFinite(ev.velocity) ? ev.velocity : 0.85,
+  }));
+  const midis = normalized.map((ev) => midiFromNoteName(ev.note)).sort((a, b) => a - b);
+  const totalTime = normalized.reduce(
+    (max, ev) => Math.max(max, (ev.start ?? 0) + (ev.duration ?? 0.4)),
+    0
+  );
+  const noteDensity = normalized.length / Math.max(1, totalTime || normalized.length * 0.4);
+  const uniqNotes = Array.from(new Set(normalized.map((ev) => ev.note)));
+  const meanVelocity =
+    normalized.reduce((sum, ev) => sum + (ev.velocity ?? 0.8), 0) / normalized.length || 0.8;
+  return {
+    medianMidi: midis[Math.floor(midis.length / 2)] ?? 60,
+    span: (midis[midis.length - 1] ?? 60) - (midis[0] ?? 60),
+    noteDensity,
+    totalTime: totalTime || normalized.length * 0.5,
+    accentNotes: uniqNotes.slice(0, 8),
+    meanVelocity,
+  };
+}
+function buildSectionBackgroundLayer(timeline = [], profile = {}, summary = {}) {
+  if (!timeline?.length) return [];
+  const density = clampValue(profile.conductorDensity ?? 0.7, 0.2, 1.5);
+  const every = Math.max(1, Math.round(1 / density));
+  const octaveShift = profile.octaveShift ?? -12;
+  const sustainMultiplier = profile.sustainMultiplier ?? 1.2;
+  const padGain = profile.padGain ?? 0.75;
+  const voice = profile.layerVoice || "pad";
+  const layer = [];
+  for (let i = 0; i < timeline.length; i += every) {
+    const base = timeline[i];
+    const midi = clampMidiValue(midiFromNoteName(base.note) + octaveShift);
+    layer.push({
+      start: base.start ?? 0,
+      duration: Math.max(0.3, (base.duration ?? 0.4) * sustainMultiplier),
+      note: nameFromMidi(midi),
+      velocity: Math.min(1.2, (base.velocity ?? summary.meanVelocity ?? 0.8) * padGain),
+      voice,
+    });
+  }
+  if (summary?.accentNotes?.length) {
+    const perAnchor = Math.max(2, (summary.totalTime || 8) / summary.accentNotes.length);
+    summary.accentNotes.forEach((anchor, idx) => {
+      const midi = clampMidiValue(midiFromNoteName(anchor) + (profile.chordOctaveShift ?? -12));
+      layer.push({
+        start: idx * perAnchor,
+        duration: perAnchor * 1.1,
+        note: nameFromMidi(midi),
+        velocity: 0.55,
+        voice: "pad",
+      });
+    });
+  }
+  return layer;
+}
+function derivePercussionSettings(profile = {}, summary = {}) {
+  const base = profile.percussion || "dembow";
+  const density = summary?.noteDensity ?? 0.6;
+  const mapped = clampValue(density * (profile.intensityBoost ?? 1), 0.4, 1.6);
+  return {
+    pattern: base,
+    intensity: mapped,
+    humanize: profile.humanize ?? 0.018,
+  };
+}
 function normalizeNoteName(name) {
   if (!name) return "A4";
   const match = name.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
@@ -266,10 +476,49 @@ function splitNotesByMusicalAnalysis(events, {
   return sections.filter((sec) => sec.length);
 }
 
+function buildTimelineFromEvents(events = [], fallbackNotes = [], bpm = 120) {
+  if (events.length) {
+    return events.map((ev) => ({
+      note: ev.note || ev.name,
+      start: ev.start ?? ev.begin ?? 0,
+      duration: ev.duration ?? ev.dur ?? 0.5,
+      velocity: ev.velocity ?? 0.9,
+    }));
+  }
+  const beat = 60 / Math.max(1, bpm || 120);
+  return fallbackNotes.map((note, idx) => ({
+    note,
+    start: idx * beat,
+    duration: beat * 0.9,
+    velocity: 0.85,
+  }));
+}
 
-// --- PRESETS CON POLIRRITMIA (muchas canciones famosas, sencillas) ---
+function buildTransitionMap(timeline = []) {
+  const map = {};
+  for (let i = 0; i < timeline.length - 1; i++) {
+    const from = timeline[i]?.note;
+    const to = timeline[i + 1]?.note;
+    if (!from || !to) continue;
+    if (!map[from]) map[from] = {};
+    map[from][to] = (map[from][to] || 0) + 1;
+  }
+  return map;
+}
+
+function weightedPick(weightMap = {}) {
+  const entries = Object.entries(weightMap);
+  if (!entries.length) return null;
+  const total = entries.reduce((sum, [, w]) => sum + (w || 0), 0) || 1;
+  let r = Math.random() * total;
+  for (const [note, weight] of entries) {
+    r -= weight || 0;
+    if (r <= 0) return note;
+  }
+  return entries[entries.length - 1][0];
+}
+
 const SONG_PRESETS = {
-  // Siguen los que ya tenías
   sevenNation: {
     label: "Seven Nation Army (riff)",
     bpm: 120,
@@ -310,7 +559,6 @@ const SONG_PRESETS = {
     ],
   },
 
-  // ---------- MARIO (más partes) ----------
   mario_intro: {
     label: "Super Mario (intro)",
     bpm: 150,
@@ -358,7 +606,6 @@ const SONG_PRESETS = {
     ],
   },
 
-  // ---------- NUEVAS: famosas y sencillas ----------
   happyBirthday: {
     label: "Happy Birthday",
     bpm: 96,
@@ -465,7 +712,7 @@ const SONG_PRESETS = {
   weWillRockYou: {
     label: "We Will Rock You (motivo nota)",
     bpm: 84,
-    notes: ["G3","G3","G3","G3","A#3","G3"], // aproximación melódica simple
+    notes: ["G3","G3","G3","G3","A#3","G3"],  
     tempos: [
       { quant: 1/8,  velocity: 1.2, angleDeg: 0,   speed: 360 },
       { quant: 1/12, velocity: 0.9, angleDeg: 14,  speed: 340 },
@@ -530,8 +777,14 @@ function applyThemeToBalls(balls, palette) {
   }));
 }
 
-// Distribuye NOTAS en dos filas alternas y crea varias TEMPO-balls con ángulos distintos.
-// Así garantizamos cruces reales nota↔tempo (no se queda golpeando solo la primera).
+function boostBallVelocities(balls, factor) {
+  return balls.map((ball) => ({
+    ...ball,
+    vx: (ball.vx || 0) * factor,
+    vy: (ball.vy || 0) * factor,
+  }));
+}
+
 function buildSequencePreset({
   notes, tempos, bpm,
   areaW = 900, areaH = 420,
@@ -548,12 +801,11 @@ function buildSequencePreset({
   const rTempo = 12;
 
   const balls = [];
-  // --- Notas: colocación alternando filas (arriba/abajo) a lo ancho ---
   const n = notes.length;
   for (let i = 0; i < n; i++){
-    const t = (n === 1) ? 0.5 : (i/(n-1)); // 0..1
+    const t = (n === 1) ? 0.5 : (i/(n-1)); 
     const x = Math.floor(marginX + t * usableW);
-    const y = (i % 2 === 0) ? yTop : yBot; // alterna arriba/abajo
+    const y = (i % 2 === 0) ? yTop : yBot; 
     balls.push({
       id: i+1,
       name: `N${i+1}`,
@@ -570,26 +822,22 @@ function buildSequencePreset({
     });
   }
 
-  // --- Tempos: varias bolas con ángulos distintos y offsets para evitar loops tontos ---
   const toRad = (deg) => (deg * Math.PI) / 180;
   const baseY = centerY;
-  const baseXLeft  = marginX - 25;             // arrancan un poco afuera
+  const baseXLeft  = marginX - 25;             
   const baseXRight = areaW - marginX + 25;
 
   tempos.forEach((tSpec, k) => {
     const id = n + 1 + k;
     const angle = toRad(tSpec.angleDeg || 0);
     const speed = tSpec.speed || 420;
-    // dirección inicial en componentes
     let vx = Math.cos(angle) * speed;
     let vy = Math.sin(angle) * speed;
 
-    // alterna algunos saliendo desde la izq y otros desde la der
     const fromLeft = (k % 2 === 0);
     const x0 = fromLeft ? baseXLeft : baseXRight;
-    const y0 = baseY + (k - (tempos.length-1)/2) * 28; // pequeñas bandas verticales
+    const y0 = baseY + (k - (tempos.length-1)/2) * 28; 
 
-    // si salen desde la derecha, invertimos vx
     if (!fromLeft) vx = -vx;
 
     balls.push({
@@ -628,10 +876,8 @@ const VOICES = [
 ];
 const DEFAULT_BG = "210 16 12";
 
-// --- Notas A0..C8 (88 teclas) ---
 const NOTE_NAMES_88 = (() => {
   const names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
-  // El piano real va de A0 (midi 21) a C8 (midi 108)
   const list = [];
   for (let midi = 21; midi <= 108; midi++) {
     const n = names[midi % 12];
@@ -644,7 +890,7 @@ const NOTE_NAMES_88 = (() => {
 function midiFromNoteName(note) {
   const map = { C:0,"C#":1,D:2,"D#":3,E:4,F:5,"F#":6,G:7,"G#":8,A:9,"A#":10,B:11 };
   const m = note.match(/^([A-G]#?)(-?\d+)$/);
-  if (!m) return 69; // A4
+  if (!m) return 69; 
   const [, n, o] = m;
   return 12 * (parseInt(o,10) + 1) + (map[n] ?? 0);
 }
@@ -656,8 +902,6 @@ function createAudio() {
   const ctx = new AudioCtx();
 
  
-
-  // ruido compartido
   const noiseBuffer = (() => {
     const buffer = ctx.createBuffer(1, ctx.sampleRate * 1.0, ctx.sampleRate);
     const data = buffer.getChannelData(0);
@@ -773,7 +1017,6 @@ function createAudio() {
       osc.start(time);
       osc.stop(time + 0.6);
     },
-    // Clap: ruido + breve “snap”
 clap(time = ctx.currentTime) {
   const noise = ctx.createBufferSource();
   noise.buffer = noiseBuffer;
@@ -781,7 +1024,6 @@ clap(time = ctx.currentTime) {
   hp.type = "highpass"; hp.frequency.value = 2000;
 
   const g = ctx.createGain();
-  // envolvente con dos picos muy cortos (simula palmas dobles)
   g.gain.setValueAtTime(0.0, time);
   g.gain.linearRampToValueAtTime(0.8, time + 0.005);
   g.gain.linearRampToValueAtTime(0.2, time + 0.012);
@@ -793,7 +1035,6 @@ clap(time = ctx.currentTime) {
   noise.stop(time + 0.13);
 },
 
-// Open hi-hat: ruido + filtro HP, decay más largo
 ohat(time = ctx.currentTime) {
   const noise = ctx.createBufferSource();
   noise.buffer = noiseBuffer;
@@ -807,7 +1048,6 @@ ohat(time = ctx.currentTime) {
   noise.stop(time + 0.36);
 },
 
-// Tom bajo: seno con barrido leve
 tomL(time = ctx.currentTime) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
@@ -821,7 +1061,6 @@ tomL(time = ctx.currentTime) {
   osc.stop(time + 0.23);
 },
 
-// Tom alto
 tomH(time = ctx.currentTime) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
@@ -835,7 +1074,6 @@ tomH(time = ctx.currentTime) {
   osc.stop(time + 0.21);
 },
 
-// Rimshot: click corto + banda
 rim(time = ctx.currentTime) {
   const noise = ctx.createBufferSource();
   noise.buffer = noiseBuffer;
@@ -854,7 +1092,6 @@ rim(time = ctx.currentTime) {
   const master = ctx.createGain();
   master.gain.value = 0.9;
 
-  // --- Compresor/Limiter master ---
   const comp = ctx.createDynamicsCompressor();
   comp.threshold.value = -12;
   comp.knee.value = 20;
@@ -862,7 +1099,6 @@ rim(time = ctx.currentTime) {
   comp.attack.value = 0.003;
   comp.release.value = 0.15;
 
-  // efectos
   const dry = ctx.createGain();
   const wet = ctx.createGain();
   const delay = ctx.createDelay(0.8);
@@ -872,7 +1108,6 @@ rim(time = ctx.currentTime) {
   const reverb = ctx.createConvolver();
   const reverbGain = ctx.createGain();
   reverbGain.gain.value = 0.4;
-  // simple impulse
   const impulse = ctx.createBuffer(2, ctx.sampleRate * 1.5, ctx.sampleRate);
   for (let ch = 0; ch < impulse.numberOfChannels; ch++) {
     const buf = impulse.getChannelData(ch);
@@ -902,12 +1137,10 @@ rim(time = ctx.currentTime) {
   comp.connect(mediaDest);
 
 
-  // --- SINTESIS DE NOTA (piano-like simple, sin samples) ---
 function playNoteByName(noteName, when = ctx.currentTime, vel = 1.0) {
   const midi = midiFromNoteName(noteName);
   const f0 = freqFromMidi(midi);
 
-  // osciladores básicos: fundamental + 2º armónico suave
   const osc1 = ctx.createOscillator();
   const osc2 = ctx.createOscillator();
   osc1.type = "sine";
@@ -915,24 +1148,19 @@ function playNoteByName(noteName, when = ctx.currentTime, vel = 1.0) {
   osc1.frequency.setValueAtTime(f0, when);
   osc2.frequency.setValueAtTime(f0 * 2, when);
 
-  // mezclador y envolvente
   const g = ctx.createGain();
-  const o2g = ctx.createGain(); // nivel del armónico
-
-  // envolvente tipo piano (ataque rápido, decaimiento exponencial)
-  const A = 0.002;       // ataque ~2ms
-  const D = 1.2;         // decaimiento ~1.2s
+  const o2g = ctx.createGain(); 
+  const A = 0.002;       
+  const D = 1.2;         
   const peak = 0.9 * vel;
 
   g.gain.setValueAtTime(0.0001, when);
   g.gain.linearRampToValueAtTime(peak, when + A);
   g.gain.exponentialRampToValueAtTime(0.0001, when + D);
 
-  // armónico más bajo de nivel
   o2g.gain.setValueAtTime(0.15 * vel, when);
   o2g.gain.exponentialRampToValueAtTime(0.0001, when + D * 0.8);
 
-  // filtro lowpass que se va cerrando (para “apagarse” tipo piano)
   const lp = ctx.createBiquadFilter();
   lp.type = "lowpass";
   lp.frequency.setValueAtTime(Math.max(1200, f0 * 6), when);
@@ -968,7 +1196,6 @@ function nextQuantizedTime(ctxTime, bpm, subdivision) {
 }
 
 
-// === Utils nota <-> frecuencia ===
 function midiFromFreq(f) { return 69 + 12 * Math.log2(f / 440); }
 function freqFromMidi(m, A4=440){ return A4 * Math.pow(2, (m-69)/12); }
 function nameFromMidi(m) {
@@ -979,7 +1206,6 @@ function nameFromMidi(m) {
   return `${name}${oct}`;
 }
 
-// === YIN: pitch detection por ventana (time-domain) ===
 function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
   const N = frame.length;
   const tauMin = Math.floor(sampleRate / maxF);
@@ -987,7 +1213,6 @@ function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
   const diff = new Float32Array(tauMax+1);
   diff.fill(0);
 
-  // diferencia acumulada
   for (let tau = 1; tau <= tauMax; tau++) {
     let d = 0;
     for (let i = 0; i < N - tau; i++) {
@@ -996,21 +1221,18 @@ function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
     }
     diff[tau] = d;
   }
-  // CMNDF
   let running = 0;
   for (let tau = 1; tau <= tauMax; tau++) {
     running += diff[tau];
     diff[tau] = diff[tau] * tau / (running || 1e-12);
   }
 
-  // primer mínimo bajo umbral
   let tau = tauMin;
   let best = -1;
   for (tau = tauMin; tau <= tauMax; tau++) {
     if (diff[tau] < threshold) { best = tau; break; }
   }
   if (best === -1) {
-    // si no cruzó el umbral, usa el mínimo global
     let minV = Infinity, minI = -1;
     for (let t = tauMin; t <= tauMax; t++) {
       if (diff[t] < minV) { minV = diff[t]; minI = t; }
@@ -1018,8 +1240,6 @@ function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
     best = minI;
   }
   if (best <= 0) return null;
-
-  // parabolic interpolation para afinar
   const x0 = diff[best-1] ?? diff[best];
   const x1 = diff[best];
   const x2 = diff[best+1] ?? diff[best];
@@ -1032,13 +1252,11 @@ function yinPitch(frame, sampleRate, threshold=0.10, minF=60, maxF=1500) {
   return freq;
 }
 
-// === Onsets simples por energía corta (RMS) + derivada ===
 function detectOnsetsMono(samples, sampleRate, hop=512, win=2048, rmsThresh=0.02, derivThresh=0.015) {
   const n = samples.length;
   const onsets = [];
   const rmsArr = [];
 
-  // RMS por ventana con hop
   for (let start = 0; start + win <= n; start += hop) {
     let sum = 0;
     for (let i = 0; i < win; i++) {
@@ -1049,30 +1267,25 @@ function detectOnsetsMono(samples, sampleRate, hop=512, win=2048, rmsThresh=0.02
     rmsArr.push(rms);
   }
 
-  // derivada positiva significativa
   for (let i = 1; i < rmsArr.length; i++) {
     const dr = rmsArr[i] - rmsArr[i-1];
     if (rmsArr[i] > rmsThresh && dr > derivThresh) {
       const t = (i * hop) / sampleRate;
-      // evita disparos demasiado cercanos (< 90 ms)
       if (onsets.length === 0 || (t - onsets[onsets.length - 1]) > 0.09) {
         onsets.push(t);
       }
     }
   }
-  // garantiza al menos un onset
   if (onsets.length === 0) onsets.push(0);
   return onsets;
 }
 
-// === Estimación de notas por segmento (entre onsets) ===
 function extractNotesFromAudioBuffer(audioBuffer, {
   downsampleTo = 22050,
   hop = 256,
   win = 2048,
   yinThresh = 0.10,
 } = {}) {
-  // 1) mezcla a mono
   const ch0 = audioBuffer.getChannelData(0);
   let mono = ch0;
   if (audioBuffer.numberOfChannels > 1) {
@@ -1084,7 +1297,6 @@ function extractNotesFromAudioBuffer(audioBuffer, {
 
   const sr = audioBuffer.sampleRate;
 
-  // 2) downsample lineal simple si hace falta
   let s = mono, srs = sr;
   if (sr > downsampleTo) {
     const ratio = sr / downsampleTo;
@@ -1096,16 +1308,14 @@ function extractNotesFromAudioBuffer(audioBuffer, {
     s = out; srs = downsampleTo;
   }
 
-  // 3) onsets
   const onsets = detectOnsetsMono(s, srs, 512, 2048);
 
-  // 4) pitch por segmentos (toma mediana de pitches válidos)
   const notesOut = [];
-  const segs = [...onsets, (s.length / srs)]; // último punto: final
+  const segs = [...onsets, (s.length / srs)]; 
   for (let k = 0; k < segs.length - 1; k++) {
     const t0 = segs[k], t1 = segs[k+1];
     const i0 = Math.floor(t0 * srs);
-    const i1 = Math.max(i0 + win, Math.floor(t1 * srs)); // asegúrate de tamaño mínimo
+    const i1 = Math.max(i0 + win, Math.floor(t1 * srs)); 
 
     const pitches = [];
     for (let i = i0; i + win <= i1; i += hop) {
@@ -1115,7 +1325,6 @@ function extractNotesFromAudioBuffer(audioBuffer, {
     }
 
     if (pitches.length) {
-      // mediana para estabilidad
       pitches.sort((a,b) => a-b);
       const med = pitches[(pitches.length/2)|0];
       const midi = midiFromFreq(med);
@@ -1133,14 +1342,12 @@ function extractNotesFromAudioBuffer(audioBuffer, {
   return notesOut;
 }
 
-// === Estimación de BPM (opcional, muy simple) desde envolvente de onset ===
 function estimateBPMFromOnsets(onsets) {
   if (!onsets || onsets.length < 4) return 100;
   const intervals = [];
   for (let i = 1; i < onsets.length; i++) intervals.push(onsets[i] - onsets[i-1]);
   const med = intervals.sort((a,b)=>a-b)[(intervals.length/2)|0];
   const bpm = Math.round(60 / Math.max(med, 1e-3));
-  // clamp razonable
   return Math.max(60, Math.min(180, bpm));
 }
 
@@ -1150,20 +1357,22 @@ function CanvasRig({
   onRemove,
   canRemove,
   preset,
-  durationSec = 8,
+  durationSec = 16,
   onDurationChange,
   shouldAutoRun = false,
   autoPlayEnabled = false,
+  forcePlay = false,
   themeKey = "midnight",
   performanceMode = false,
+  melodyVoice = "piano",
+  onInstrumentChange,
+  backgroundPad = true,
 }) {
-  // --- Canvas / Phys ---
   const [selectedSongKey, setSelectedSongKey] = useState("sevenNation");
 
-  // --- Tamaño del canvas redimensionable ---
-const [canvasSize, setCanvasSize] = useState({ w: 900, h: 420 }); // tamaño inicial
+const [canvasSize, setCanvasSize] = useState({ w: 520, h: 520 }); 
 const canvasWrapRef = useRef(null);
-const resizingRef = useRef(null); // { startX, startY, startW, startH }
+const resizingRef = useRef(null); 
   useEffect(() => {
     needsRedrawRef.current = true;
   }, [canvasSize]);
@@ -1174,16 +1383,13 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
   const lastTRef = useRef(0);
   const pairsCooldown = useRef(new Map());
 
-  // --- Audio ---
   const audioRef = useRef(null);
 
-  // Grabación (opcional)
   const mediaRecorderRef = useRef(null);
   const [isRecording, setIsRecording] = useState(false);
   const recordedChunksRef = useRef([]);
   const [flashAlpha, setFlashAlpha] = useState(0);
 
-  // Transporte
   const [isRunning, setIsRunning] = useState(false);
   const isRunningRef = useRef(isRunning);
   useEffect(() => {
@@ -1193,7 +1399,6 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
   const [bpm, setBpm] = useState(preset?.bpm ?? 100);
   const [quant, setQuant] = useState(1 / 8);
 
-  // Estado de bolas (con name)
   const palette = useMemo(() => getThemePalette(themeKey), [themeKey]);
   const [balls, setBalls] = useState(() =>
     preset?.balls
@@ -1204,8 +1409,8 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
             name: `Bola ${i + 1}`,
             x: rnd(100, 500),
             y: rnd(80, 300),
-            vx: rnd(-120, 120),
-            vy: rnd(-120, 120),
+          vx: rnd(-120, 120) * 1.3,
+          vy: rnd(-120, 120) * 1.3,
             r: rnd(10, 16),
             color: `hsl(${Math.floor(rnd(0, 360))} 80% 60%)`,
             voice: VOICES[i % VOICES.length].value,
@@ -1220,6 +1425,21 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
   );
   const ballsRef = useRef([]);
   const needsRedrawRef = useRef(true);
+  const timelineEventsRef = useRef(Array.isArray(preset?.timeline) ? preset.timeline : []);
+  const timelineCursorRef = useRef(0);
+  const timelineStartRef = useRef(0);
+  const timelineRafRef = useRef(null);
+  const backgroundEventsRef = useRef(
+    Array.isArray(preset?.backgroundMelody) ? preset.backgroundMelody : []
+  );
+  const backgroundCursorRef = useRef(0);
+  const backgroundStartRef = useRef(0);
+  const backgroundRafRef = useRef(null);
+  const backgroundLengthRef = useRef(Math.max(durationSec || 8, 1));
+  const percussionPatternRef = useRef(preset?.percussion || null);
+  const percussionStateRef = useRef({ nextTime: 0, step: 0 });
+  const percussionRafRef = useRef(null);
+  const lastPadTriggerRef = useRef(-Infinity);
   useEffect(() => {
     ballsRef.current = balls.map((b) => ({ ...b }));
     needsRedrawRef.current = true;
@@ -1238,35 +1458,66 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
   };
   const presetVersionRef = useRef(preset?.version ?? null);
   useEffect(() => {
-    applyBallsUpdate((prev) => applyThemeToBalls(prev, palette));
+    setBalls((prev) => applyThemeToBalls(prev, palette));
   }, [palette]);
+  useEffect(() => {
+    timelineEventsRef.current = Array.isArray(preset?.timeline) ? preset.timeline : [];
+    markovMapRef.current = typeof preset?.transitions === "object" ? preset.transitions : {};
+    const firstNote = timelineEventsRef.current[0]?.note || preset?.noteOrder?.[0] || null;
+    setAllowedNotes(firstNote ? [firstNote] : []);
+    timelineCursorRef.current = 0;
+    backgroundEventsRef.current = Array.isArray(preset?.backgroundMelody)
+      ? preset.backgroundMelody
+      : [];
+    backgroundCursorRef.current = 0;
+    const maxEnd = backgroundEventsRef.current.reduce(
+      (acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)),
+      0
+    );
+    backgroundLengthRef.current = Math.max(durationSec || 8, maxEnd || 1);
+    percussionPatternRef.current = preset?.percussion || null;
+    lastPadTriggerRef.current = -Infinity;
+    needsRedrawRef.current = true;
+  }, [preset]);
+  useEffect(() => {
+    timelineEventsRef.current = Array.isArray(preset?.timeline) ? preset.timeline : [];
+    timelineCursorRef.current = 0;
+  }, [preset]);
   useEffect(() => {
     if (!preset || !preset.version || presetVersionRef.current === preset.version) return;
     presetVersionRef.current = preset.version;
     if (Array.isArray(preset.balls)) {
-      applyBallsUpdate(preset.balls.map((ball, idx) => ({ ...ball, id: idx + 1 })));
+      applyBallsUpdate(applyThemeToBalls(preset.balls.map((ball, idx) => ({ ...ball, id: idx + 1 })), palette));
     }
     if (preset.bpm) setBpm(preset.bpm);
     ensureAudio();
-    const autoStart = autoPlayEnabled ? shouldAutoRun : false;
+    const autoStart = (autoPlayEnabled ? shouldAutoRun : false) || forcePlay;
     setIsRunning(autoStart);
-  }, [preset, autoPlayEnabled, shouldAutoRun]);
+  }, [preset, autoPlayEnabled, shouldAutoRun, palette, forcePlay]);
 
-  // sincroniza con auto-play
   useEffect(() => {
-    if (!autoPlayEnabled) return;
-    if (shouldAutoRun) {
+    if (!autoPlayEnabled && !forcePlay) return;
+    const shouldRun = (autoPlayEnabled && shouldAutoRun) || forcePlay;
+    if (shouldRun) {
       ensureAudio();
       setIsRunning(true);
     } else {
       setIsRunning(false);
     }
-  }, [shouldAutoRun, autoPlayEnabled]);
+  }, [shouldAutoRun, autoPlayEnabled, forcePlay]);
 
   useEffect(() => {
     if (!shouldAutoRun) return;
     setFlashAlpha(0.6);
   }, [shouldAutoRun]);
+  useEffect(() => {
+    const currentMax = backgroundEventsRef.current.reduce(
+      (acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)),
+      0
+    );
+    backgroundLengthRef.current = Math.max(durationSec || 8, currentMax || 1);
+    needsRedrawRef.current = true;
+  }, [durationSec]);
 
   useEffect(() => {
     if (flashAlpha <= 0) return;
@@ -1276,7 +1527,35 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
     return () => cancelAnimationFrame(id);
   }, [flashAlpha]);
 
-  // --- Interacción pointer (drag & flick) ---
+  const noteOrder = useMemo(() => preset?.noteOrder || [], [preset]);
+  const noteOrderRef = useRef(noteOrder);
+  const noteIndexRef = useRef(0);
+  const [allowedNotes, setAllowedNotes] = useState(noteOrder[0] ? [noteOrder[0]] : []);
+  const markovMapRef = useRef(typeof preset?.transitions === "object" ? preset.transitions : {});
+  const backgroundLayerCount = preset?.backgroundMelody?.length ?? 0;
+  const percussionSignature = `${preset?.percussion?.pattern || "none"}-${
+    Math.round((preset?.percussion?.intensity ?? 0) * 100)
+  }`;
+  useEffect(() => {
+    noteOrderRef.current = noteOrder;
+    noteIndexRef.current = 0;
+    if (timelineEventsRef.current.length) {
+      setAllowedNotes([timelineEventsRef.current[0].note]);
+    } else if (noteOrder[0]) {
+      setAllowedNotes([noteOrder[0]]);
+    } else {
+      setAllowedNotes([]);
+    }
+  }, [noteOrder]);
+  const resetNoteOrder = useCallback(() => {
+    noteIndexRef.current = 0;
+    const firstTimeline = timelineEventsRef.current[0]?.note;
+    if (firstTimeline) setAllowedNotes([firstTimeline]);
+    else if (noteOrderRef.current[0]) setAllowedNotes([noteOrderRef.current[0]]);
+    else setAllowedNotes([]);
+  }, []);
+  const allowedNoteLabel = allowedNotes?.length ? allowedNotes.join(", ") : "—";
+
   const draggingIdRef = useRef(null);
   const dragOffsetRef = useRef({ x: 0, y: 0 });
   const lastPtrRef = useRef({ x: 0, y: 0, t: 0 });
@@ -1299,12 +1578,10 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
     return [null, -1];
   }
 
-  // Audio ensure
-  const ensureAudio = () => {
+  const ensureAudio = useCallback(() => {
     if (!audioRef.current) audioRef.current = getSharedAudio();
     if (audioRef.current.ctx.state !== "running") audioRef.current.ctx.resume();
 
-    // MediaRecorder init una vez
     if (!mediaRecorderRef.current) {
       try {
         const stream = audioRef.current.mediaDest.stream;
@@ -1329,29 +1606,238 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
         console.warn("MediaRecorder no disponible:", err);
       }
     }
-  };
+  }, []);
+
+  const playInstrumentNote = useCallback((note, when, velocity = 1.0) => {
+    if (!note) return;
+    ensureAudio();
+    const { playNoteByName, voices } = audioRef.current;
+    const midi = midiFromNoteName(note);
+    const freq = freqFromMidi(midi);
+    switch (melodyVoice) {
+      case "pad":
+        voices.pad?.(when, freq);
+        break;
+      case "bass":
+        voices.bass?.(when, freq);
+        break;
+      case "blip":
+        (voices.blip || playNoteByName)(when);
+        playNoteByName(note, when, velocity * 0.7);
+        break;
+      default:
+        playNoteByName(note, when, velocity);
+        break;
+    }
+    if (melodyVoice !== "pad") voices.pad?.(when + 0.01, freq);
+    if (melodyVoice !== "bass") voices.bass?.(when + 0.02, freq / 2);
+  }, [ensureAudio, melodyVoice]);
 
   const triggerCombo = useCallback((tempoBall, noteBall) => {
     if (!audioRef.current) return;
-    const { ctx, playNoteByName } = audioRef.current;
+    const { ctx } = audioRef.current;
   
-    // cuantización: usa la del tempoBall si está, si no la global
+    const sequence = noteOrderRef.current;
+    const allowedSet = allowedNotes?.length ? allowedNotes : sequence;
+    if (allowedSet.length && !allowedSet.includes(noteBall.note)) return;
+ 
     const sub = tempoBall?.tempoQuant || quant;
     const t = ctx.currentTime + 0.03;
     const qt = nextQuantizedTime(t, bpm, sub * 4);
-  
+ 
     const vel = Math.max(0.1, Math.min(1.5, tempoBall?.velocity ?? 1.0));
-    // Por ahora siempre nota (piano sintético):
-    playNoteByName(noteBall.note, qt, vel);
-    const midi = midiFromNoteName(noteBall.note);
-    const freq = freqFromMidi(midi);
-    audioRef.current.voices?.pad?.(qt, freq);
-    audioRef.current.voices?.bass?.(qt, freq / 2);
-  }, [bpm, quant]);
+    playInstrumentNote(noteBall.note, qt, vel);
+    const transitions = markovMapRef.current[noteBall.note];
+    if (transitions && Object.keys(transitions).length) {
+      setAllowedNotes([weightedPick(transitions)]);
+    } else if (sequence.length) {
+      noteIndexRef.current = (noteIndexRef.current + 1) % sequence.length;
+      const next = sequence[noteIndexRef.current % sequence.length] ?? sequence[0] ?? null;
+      setAllowedNotes(next ? [next] : []);
+    } else {
+      setAllowedNotes([]);
+    }
+  }, [allowedNotes, bpm, playInstrumentNote, quant]);
   const triggerComboRef = useRef(triggerCombo);
   useEffect(() => { triggerComboRef.current = triggerCombo; }, [triggerCombo]);
 
-  // Física + dibujo + eventos pointer
+  const startTimelinePlayback = useCallback(() => {
+    const events = timelineEventsRef.current;
+    if (!events.length) return;
+    ensureAudio();
+    const { ctx } = audioRef.current;
+    timelineCursorRef.current = 0;
+    timelineStartRef.current = ctx.currentTime;
+    const lookAhead = 0.25;
+
+    const loop = () => {
+      if (!isRunningRef.current) return;
+      const list = timelineEventsRef.current;
+      if (!list.length) return;
+      const now = ctx.currentTime;
+      const elapsed = now - timelineStartRef.current;
+      while (
+        timelineCursorRef.current < list.length &&
+        (list[timelineCursorRef.current].start ?? 0) <= elapsed + lookAhead
+      ) {
+        const ev = list[timelineCursorRef.current];
+        const when = timelineStartRef.current + (ev.start ?? 0);
+        if (when >= now) playInstrumentNote(ev.note, when, ev.velocity ?? 0.9);
+        if (
+          backgroundPad &&
+          !backgroundEventsRef.current.length &&
+          audioRef.current?.voices?.pad &&
+          (ev.start ?? 0) - lastPadTriggerRef.current > 0.8
+        ) {
+          const freq = freqFromMidi(midiFromNoteName(ev.note));
+          audioRef.current.voices.pad(when, freq * 0.5);
+          lastPadTriggerRef.current = ev.start ?? 0;
+        }
+        timelineCursorRef.current++;
+      }
+      if (timelineCursorRef.current >= list.length) return;
+      timelineRafRef.current = requestAnimationFrame(loop);
+    };
+
+    timelineRafRef.current = requestAnimationFrame(loop);
+  }, [backgroundPad, ensureAudio, playInstrumentNote]);
+
+  const startBackgroundLayer = useCallback(() => {
+    const events = backgroundEventsRef.current;
+    if (!events.length || !backgroundPad) return;
+    ensureAudio();
+    const { ctx, voices, playNoteByName } = audioRef.current;
+    const lookAhead = 0.25;
+    backgroundCursorRef.current = 0;
+    backgroundStartRef.current = ctx.currentTime;
+
+    const trigger = (ev, when) => {
+      const voice = ev.voice || "pad";
+      const velocity = ev.velocity ?? 0.7;
+      if (!ev.note) return;
+      const freq = freqFromMidi(midiFromNoteName(ev.note));
+      if (voice === "pad" && voices.pad) voices.pad(when, freq);
+      else if (voice === "bass" && voices.bass) voices.bass(when, freq);
+      else if (voice === "blip" && voices.blip) {
+        voices.blip(when);
+        playNoteByName(ev.note, when, velocity);
+      } else {
+        playNoteByName(ev.note, when, velocity);
+      }
+    };
+
+    const loop = () => {
+      if (!isRunningRef.current) return;
+      const list = backgroundEventsRef.current;
+      if (!list.length) return;
+      const now = ctx.currentTime;
+      const elapsed = now - backgroundStartRef.current;
+      while (
+        backgroundCursorRef.current < list.length &&
+        (list[backgroundCursorRef.current].start ?? 0) <= elapsed + lookAhead
+      ) {
+        const ev = list[backgroundCursorRef.current];
+        const when = backgroundStartRef.current + (ev.start ?? 0);
+        if (when >= now) trigger(ev, when);
+        backgroundCursorRef.current++;
+      }
+      if (backgroundCursorRef.current >= list.length) return;
+      backgroundRafRef.current = requestAnimationFrame(loop);
+    };
+
+    backgroundRafRef.current = requestAnimationFrame(loop);
+  }, [backgroundPad, ensureAudio]);
+
+  const startPercussionLoop = useCallback(() => {
+    const settings = percussionPatternRef.current;
+    if (!settings?.pattern) return;
+    const pattern = PERCUSSION_PATTERNS[settings.pattern];
+    if (!pattern?.steps?.length) return;
+    ensureAudio();
+    const { ctx, voices } = audioRef.current;
+    const steps = pattern.steps.length;
+    const stepDur = ((60 / bpm) * 4) / steps;
+    const lookAhead = 0.25;
+    const intensity = clampValue(settings.intensity ?? 1, 0.3, 1.6);
+    percussionStateRef.current = { nextTime: ctx.currentTime + 0.04, step: 0 };
+
+    const loop = () => {
+      if (!isRunningRef.current) return;
+      const now = ctx.currentTime;
+      while (percussionStateRef.current.nextTime < now + lookAhead) {
+        const stepIdx = percussionStateRef.current.step % steps;
+        const events = pattern.steps[stepIdx] || [];
+        events.forEach((voiceName) => {
+          if (voiceName === "hat" && Math.random() > intensity) return;
+          if (voiceName === "clap" && intensity < 0.6 && stepIdx % 4 !== 0) return;
+          voices[voiceName]?.(percussionStateRef.current.nextTime);
+        });
+        percussionStateRef.current.nextTime += stepDur;
+        percussionStateRef.current.step++;
+      }
+      percussionRafRef.current = requestAnimationFrame(loop);
+    };
+
+    percussionRafRef.current = requestAnimationFrame(loop);
+  }, [bpm, ensureAudio]);
+
+  useEffect(() => {
+    if (timelineRafRef.current) {
+      cancelAnimationFrame(timelineRafRef.current);
+      timelineRafRef.current = null;
+    }
+    if (!isRunning) {
+      timelineCursorRef.current = 0;
+      lastPadTriggerRef.current = -Infinity;
+      return;
+    }
+    if (!timelineEventsRef.current.length) return;
+    startTimelinePlayback();
+    return () => {
+      if (timelineRafRef.current) {
+        cancelAnimationFrame(timelineRafRef.current);
+        timelineRafRef.current = null;
+      }
+    };
+  }, [isRunning, startTimelinePlayback]);
+  useEffect(() => {
+    if (!backgroundPad) lastPadTriggerRef.current = -Infinity;
+  }, [backgroundPad]);
+
+  useEffect(() => {
+    if (backgroundRafRef.current) {
+      cancelAnimationFrame(backgroundRafRef.current);
+      backgroundRafRef.current = null;
+    }
+    if (!isRunning || !backgroundPad || !backgroundEventsRef.current.length) {
+      backgroundCursorRef.current = 0;
+      return;
+    }
+    startBackgroundLayer();
+    return () => {
+      if (backgroundRafRef.current) {
+        cancelAnimationFrame(backgroundRafRef.current);
+        backgroundRafRef.current = null;
+      }
+    };
+  }, [backgroundPad, backgroundLayerCount, isRunning, startBackgroundLayer]);
+
+  useEffect(() => {
+    if (percussionRafRef.current) {
+      cancelAnimationFrame(percussionRafRef.current);
+      percussionRafRef.current = null;
+    }
+    percussionStateRef.current = { nextTime: 0, step: 0 };
+    if (!isRunning || !percussionPatternRef.current?.pattern) return;
+    startPercussionLoop();
+    return () => {
+      if (percussionRafRef.current) {
+        cancelAnimationFrame(percussionRafRef.current);
+        percussionRafRef.current = null;
+      }
+    };
+  }, [bpm, isRunning, percussionSignature, startPercussionLoop]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1509,20 +1995,31 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
               const key = `${a.id}-${b.id}`;
               const now = t;
               const last = pairsCooldown.current.get(key) || 0;
-              if (now - last > 80) {
+              const cooldown = performanceMode ? 60 : 30;
+              if (now - last > cooldown) {
                 pairsCooldown.current.set(key, now);
                 const aIsTempo = a.type === "tempo";
                 const bIsTempo = b.type === "tempo";
                 const aIsNote = a.type === "note";
                 const bIsNote = b.type === "note";
-                if (aIsTempo && bIsNote) triggerComboRef.current?.(a, b);
-                else if (bIsTempo && aIsNote) triggerComboRef.current?.(b, a);
+                const allowedSet = allowedNotes?.length ? allowedNotes : null;
+                const aNoteAllowed = !allowedSet || !aIsNote || allowedSet.includes(a.note);
+                const bNoteAllowed = !allowedSet || !b.isNote || allowedSet.includes(b.note);
+                const willTrigger =
+                  (aIsTempo && bIsNote && bNoteAllowed) || (bIsTempo && aIsNote && aNoteAllowed);
+                if (willTrigger) {
+                  if (aIsTempo && bIsNote) triggerComboRef.current?.(a, b);
+                  else if (bIsTempo && aIsNote) triggerComboRef.current?.(b, a);
+                } else {
+                  continue; 
+                }
               }
-              const overlap = minD - dist || 0.01;
+              const overlap = (minD - dist || 0.01) * (performanceMode ? 0.35 : 0.7);
               const nx = dx / (dist || 1);
               const ny = dy / (dist || 1);
-              a.x -= nx * overlap * 0.5; a.y -= ny * overlap * 0.5;
-              b.x += nx * overlap * 0.5; b.y += ny * overlap * 0.5;
+              a.x -= nx * overlap * 0.35; a.y -= ny * overlap * 0.35;
+              b.x += nx * overlap * 0.35; b.y += ny * overlap * 0.35;
+              if (Math.random() < 0.15 && !performanceMode) continue;
               const avn = a.vx * nx + a.vy * ny;
               const bvn = b.vx * nx + b.vy * ny;
               const swap = bvn - avn;
@@ -1542,11 +2039,66 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
         ctx.fillStyle = `hsl(${bg} / 0.12)`;
         ctx.fillRect(0, 0, width, height);
         ctx.restore();
+        const bgLayer = backgroundPad ? backgroundEventsRef.current : [];
+        if (bgLayer.length) {
+          const laneMargin = Math.max(10, width * 0.02);
+          const laneWidth = Math.max(10, width - laneMargin * 2);
+          const laneHeight = Math.min(70, height * 0.18);
+          const laneTop = laneMargin;
+          const blockTop = laneTop + 6;
+          const blockHeight = laneHeight - 12;
+          const totalLen = backgroundLengthRef.current || durationSec || 8;
+          ctx.save();
+          ctx.fillStyle = "rgba(15,23,42,0.55)";
+          ctx.fillRect(laneMargin, laneTop, laneWidth, laneHeight);
+          bgLayer.forEach((ev, idx) => {
+            const startRatio = clampValue((ev.start ?? 0) / totalLen, 0, 1);
+            const durRatio = clampValue((ev.duration ?? 0.4) / totalLen, 0, 1 - startRatio + 0.001);
+            const x = laneMargin + startRatio * laneWidth;
+            const w = Math.max(2, durRatio * laneWidth);
+            const color =
+              BACKGROUND_VOICE_COLORS[ev.voice] || BACKGROUND_VOICE_COLORS.default;
+            ctx.fillStyle = color;
+            ctx.fillRect(x, blockTop, w, blockHeight);
+            if (blockHeight > 18) {
+              ctx.fillStyle = "rgba(15,23,42,0.8)";
+              ctx.font = `${Math.max(10, 12 * dpr)}px sans-serif`;
+              ctx.textBaseline = "middle";
+              ctx.fillText(ev.note, x + 4, blockTop + blockHeight / 2);
+            }
+          });
+          const audioCtx = audioRef.current?.ctx;
+          const progressBase = bgLayer.length
+            ? backgroundStartRef.current
+            : timelineStartRef.current;
+          let progressRatio = 0;
+          if (audioCtx && progressBase) {
+            const elapsed = Math.max(0, audioCtx.currentTime - progressBase);
+            progressRatio = clampValue(elapsed / totalLen, 0, 1);
+          }
+          ctx.strokeStyle = "rgba(248,250,252,0.9)";
+          ctx.lineWidth = Math.max(1, dpr);
+          const px = laneMargin + progressRatio * laneWidth;
+          ctx.beginPath();
+          ctx.moveTo(px, laneTop);
+          ctx.lineTo(px, laneTop + laneHeight);
+          ctx.stroke();
+          ctx.fillStyle = "rgba(248,250,252,0.8)";
+          ctx.font = `${Math.max(10, 12 * dpr)}px sans-serif`;
+          ctx.textBaseline = "top";
+          ctx.fillText("Melodía de fondo", laneMargin + 4, Math.max(2, laneTop - 14 * dpr));
+          ctx.restore();
+        }
+        const allowedSet = allowedNotes?.length ? new Set(allowedNotes) : null;
         for (const b of arr) {
+          const allowed = !allowedSet || !b.isNote || allowedSet.has(b.note);
+          ctx.save();
+          ctx.globalAlpha = allowed ? 1 : 0.28;
           ctx.beginPath();
           ctx.fillStyle = b.color;
           ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
           ctx.fill();
+          ctx.restore();
         }
         if (showArrowRef.current && draggingIdRef.current && !(performanceMode && !shouldSimulate)) {
           const id = draggingIdRef.current;
@@ -1589,7 +2141,7 @@ const resizingRef = useRef(null); // { startX, startY, startW, startH }
       canvas.removeEventListener("pointercancel", onPointerUp);
       ro?.disconnect();
     };
-  }, [performanceMode, palette]);
+  }, [performanceMode, palette, allowedNotes]);
 
 
 
@@ -1606,7 +2158,7 @@ const loadSongPreset = (key, palette) => {
     bpm: preset.bpm,
     areaW, areaH,
   });
-  const newBalls = applyThemeToBalls(builtBalls, palette);
+  const newBalls = applyThemeToBalls(boostBallVelocities(builtBalls, 1.8), palette);
 
   setBpm(newBpm);
   applyBallsUpdate(newBalls);
@@ -1616,8 +2168,6 @@ const loadSongPreset = (key, palette) => {
 };
 
 
-
-  // --- Helpers UI ---
   const addNoteBall = () => {
     const id = (balls.at(-1)?.id || 0) + 1;
     applyBallsUpdate((arr) => [...arr, {
@@ -1625,8 +2175,8 @@ const loadSongPreset = (key, palette) => {
       name: `Bola ${id}`,
       x: rnd(50, (canvasRef.current?.clientWidth || 640) - 50),
       y: rnd(50, (canvasRef.current?.clientHeight || 360) - 50),
-      vx: rnd(-160, 160),
-      vy: rnd(-160, 160),
+      vx: rnd(-160, 160) * 1.4,
+      vy: rnd(-160, 160) * 1.4,
       r: rnd(10, 16),
       color: palette.note(arr.length),
       voice: VOICES[Math.floor(rnd(0, VOICES.length))].value,
@@ -1645,8 +2195,8 @@ const loadSongPreset = (key, palette) => {
       name: `Tempo ${id}`,
       x: rnd(50, (canvasRef.current?.clientWidth || 640) - 50),
       y: rnd(50, (canvasRef.current?.clientHeight || 360) - 50),
-      vx: rnd(-160, 160),
-      vy: rnd(-160, 160),
+      vx: rnd(-160, 160) * 1.4,
+      vy: rnd(-160, 160) * 1.4,
       r: rnd(10, 16),
       color: palette.tempo(arr.length),
       voice: "blip",
@@ -1690,7 +2240,7 @@ const loadSongPreset = (key, palette) => {
   const nudgeEnergy = (scale = 1.1) =>
     applyBallsUpdate((arr) => arr.map((b) => ({ ...b, vx: b.vx * scale, vy: b.vy * scale })));
 
-  // Presets
+  
   const savePreset = () => {
     const data = { bpm, quant, balls };
     localStorage.setItem("rapsody_preset", JSON.stringify(data));
@@ -1708,7 +2258,6 @@ const loadSongPreset = (key, palette) => {
     }
   };
 
-  // Grabación
   const toggleRecording = () => {
     ensureAudio();
     const mr = mediaRecorderRef.current;
@@ -1753,6 +2302,30 @@ const loadSongPreset = (key, palette) => {
             className="bg-slate-800 rounded-xl px-2 py-1 w-20 text-right"
           />
         </label>
+        <label className="flex items-center gap-2 text-sm text-slate-300">
+          Instrumento
+          <select
+            value={melodyVoice}
+            onChange={(e) => onInstrumentChange?.(e.target.value)}
+            className="bg-slate-800 rounded-xl px-3 py-1"
+          >
+            {MELODY_VOICES.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+        </label>
+        {(timelineEventsRef.current.length || noteOrder.length) ? (
+          <div className="flex items-center gap-2 text-sm text-slate-300">
+            <span>Notas permitidas: {allowedNoteLabel}</span>
+            <button
+              onClick={resetNoteOrder}
+              className="px-2 py-1 rounded-xl bg-slate-700 hover:bg-slate-600 text-xs"
+              type="button"
+            >
+              Reiniciar orden
+            </button>
+          </div>
+        ) : null}
         <button
           onClick={() => { ensureAudio(); setIsRunning((v) => !v); }}
           className={`px-4 py-2 rounded-2xl shadow-sm transition ${
@@ -1882,7 +2455,7 @@ const loadSongPreset = (key, palette) => {
           startW: rect.width,
           startH: rect.height,
         };
-        // captura el puntero en el handle
+
         e.currentTarget.setPointerCapture?.(e.pointerId);
       }}
       onPointerMove={(e) => {
@@ -1891,7 +2464,6 @@ const loadSongPreset = (key, palette) => {
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
 
-        // límites mínimos/máximos
         const minW = 360, minH = 240;
         const maxW = 1600, maxH = 1000;
 
@@ -1906,7 +2478,6 @@ const loadSongPreset = (key, palette) => {
       }}
       className="absolute bottom-1.5 right-1.5 h-4 w-4 cursor-nwse-resize rounded-md"
       style={{
-        // un pequeño grip visual
         background:
           "linear-gradient(135deg, transparent 0 40%, rgba(255,255,255,.25) 40% 60%, transparent 60% 100%)",
       }}
@@ -1923,66 +2494,66 @@ const loadSongPreset = (key, palette) => {
               Bolas e instrumentos
             </div>
             <div className="space-y-2 overflow-y-auto pr-2 p-3" style={{ maxHeight: `${canvasSize.h}px` }} role="list" aria-label="Bolas e instrumentos">
-              {balls.map((b) => (
-                <div key={b.id} className="flex items-center gap-3 bg-slate-900/40 rounded-xl p-2">
-                  <span className="inline-block h-3 w-3 rounded-full" style={{ background: b.color }} />
-                  <input
-                    type="text"
-                    value={b.name}
-                    onChange={(e) => updateBallName(b.id, e.target.value)}
-                    className="bg-slate-700 rounded px-2 py-1 text-sm text-slate-100 flex-1 min-w-0"
-                    placeholder={`Bola ${b.id}`}
-                  />
-{/* Tipo de bola */}
-<select
-  value={b.type}
-  onChange={(e) => updateBallType(b.id, e.target.value)}
-  className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
->
-  <option value="note">Nota</option>
-  <option value="tempo">Tempo</option>
-</select>
-
-{/* Config según tipo */}
-{b.type === "note" ? (
-  <select
-    value={b.note}
-    onChange={(e) => updateBallNote(b.id, e.target.value)}
-    className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
-  >
-    {NOTE_NAMES_88.map((n) => (
-      <option key={n} value={n}>{n}</option>
-    ))}
-  </select>
-) : (
-  <div className="flex items-center gap-2">
-    <select
-      value={b.tempoQuant}
-      onChange={(e) => updateBallTempoQuant(b.id, parseFloat(e.target.value))}
-      className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
-      title="Subdivisión de cuantización para este tempo-ball"
-    >
-      {TEMPO_QUANT_OPTIONS.map((q) => (
-        <option key={q.value} value={q.value}>{q.label}</option>
-      ))}
-    </select>
-    <label className="flex items-center gap-2 text-xs text-slate-300">
-      Vel
-      <input
-        type="range" min={0.3} max={1.5} step={0.05}
-        value={b.velocity ?? 1}
-        onChange={(e) => updateBallVelocity(b.id, parseFloat(e.target.value))}
-      />
-      <span className="w-8 text-right">{(b.velocity ?? 1).toFixed(2)}</span>
-    </label>
-  </div>
-)}
-
-
-
-
-                </div>
-              ))}
+              {balls.map((b) => {
+                const noteLocked = Boolean(
+                  allowedNotes?.length &&
+                  b.isNote &&
+                  !allowedNotes.includes(b.note)
+                );
+                return (
+                  <div key={b.id} className="flex items-center gap-3 bg-slate-900/40 rounded-xl p-2" style={{ opacity: noteLocked ? 0.5 : 1 }}>
+                    <span className="inline-block h-3 w-3 rounded-full" style={{ background: b.color }} />
+                    <input
+                      type="text"
+                      value={b.name}
+                      onChange={(e) => updateBallName(b.id, e.target.value)}
+                      className="bg-slate-700 rounded px-2 py-1 text-sm text-slate-100 flex-1 min-w-0"
+                      placeholder={`Bola ${b.id}`}
+                    />
+                    <select
+                      value={b.type}
+                      onChange={(e) => updateBallType(b.id, e.target.value)}
+                      className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+                    >
+                      <option value="note">Nota</option>
+                      <option value="tempo">Tempo</option>
+                    </select>
+                    {b.type === "note" ? (
+                      <select
+                        value={b.note}
+                        onChange={(e) => updateBallNote(b.id, e.target.value)}
+                        className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+                      >
+                        {NOTE_NAMES_88.map((n) => (
+                          <option key={n} value={n}>{n}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={b.tempoQuant}
+                          onChange={(e) => updateBallTempoQuant(b.id, parseFloat(e.target.value))}
+                          className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
+                          title="Subdivisión de cuantización para este tempo-ball"
+                        >
+                          {TEMPO_QUANT_OPTIONS.map((q) => (
+                            <option key={q.value} value={q.value}>{q.label}</option>
+                          ))}
+                        </select>
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          Vel
+                          <input
+                            type="range" min={0.3} max={1.5} step={0.05}
+                            value={b.velocity ?? 1}
+                            onChange={(e) => updateBallVelocity(b.id, parseFloat(e.target.value))}
+                          />
+                          <span className="w-8 text-right">{(b.velocity ?? 1).toFixed(2)}</span>
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </aside>
@@ -1992,27 +2563,33 @@ const loadSongPreset = (key, palette) => {
 }
 
 export default function Rapsody() {
-  const [canvasInstances, setCanvasInstances] = useState([{ id: Date.now(), preset: null, durationSec: 8 }]);
+  const defaultInstrument = MELODY_VOICES[0].value;
+  const [canvasInstances, setCanvasInstances] = useState([
+    { id: Date.now(), preset: null, durationSec: 8, instrument: defaultInstrument, sectionIndex: 0 },
+  ]);
   const [songFile, setSongFile] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [autoPlay, setAutoPlay] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(null);
+  const [currentSection, setCurrentSection] = useState(0);
   const autoTimerRef = useRef(null);
   const [theme, setTheme] = useState("midnight");
   const [performanceMode, setPerformanceMode] = useState(false);
   const [fxEnabled, setFxEnabled] = useState(true);
+  const [backgroundPad, setBackgroundPad] = useState(true);
   const importProjectInputRef = useRef(null);
+  const [playAll, setPlayAll] = useState(false);
 
   const addCanvas = () =>
     setCanvasInstances((prev) => [
       ...prev,
-      { id: Date.now() + Math.random(), preset: null, durationSec: 8 },
+      { id: Date.now() + Math.random(), preset: null, durationSec: 8, instrument: defaultInstrument, sectionIndex: prev[prev.length - 1]?.sectionIndex ?? 0 },
     ]);
 
   const removeCanvas = (id) =>
     setCanvasInstances((prev) => {
       const next = prev.length > 1 ? prev.filter((c) => c.id !== id) : prev;
-      if (activeIndex !== null && activeIndex >= next.length) setActiveIndex(next.length - 1);
+      const maxSection = next.reduce((max, inst) => Math.max(max, inst.sectionIndex ?? 0), 0);
+      if (currentSection > maxSection) setCurrentSection(maxSection);
       return next;
     });
 
@@ -2024,7 +2601,7 @@ export default function Rapsody() {
 
   const stopAutoPlay = () => {
     setAutoPlay(false);
-    setActiveIndex(null);
+    setCurrentSection(0);
     if (autoTimerRef.current) {
       clearTimeout(autoTimerRef.current);
       autoTimerRef.current = null;
@@ -2033,7 +2610,7 @@ export default function Rapsody() {
 
   const startAutoPlay = () => {
     if (!canvasInstances.length) return;
-    setActiveIndex(0);
+    setCurrentSection(0);
     setAutoPlay(true);
   };
 
@@ -2061,7 +2638,14 @@ export default function Rapsody() {
     try {
       const text = await file.text();
       const data = JSON.parse(text);
-      if (Array.isArray(data?.canvasInstances)) setCanvasInstances(data.canvasInstances);
+      if (Array.isArray(data?.canvasInstances)) {
+        const imported = data.canvasInstances.map((inst) => ({
+          ...inst,
+          instrument: inst.instrument || defaultInstrument,
+          sectionIndex: inst.sectionIndex ?? 0,
+        }));
+        setCanvasInstances(imported.length ? imported : [{ id: Date.now(), preset: null, durationSec: 8, instrument: defaultInstrument, sectionIndex: 0 }]);
+      }
       if (typeof data?.theme === "string") setTheme(data.theme);
       if (typeof data?.performanceMode === "boolean") setPerformanceMode(data.performanceMode);
       if (typeof data?.fxEnabled === "boolean") setFxEnabled(data.fxEnabled);
@@ -2071,14 +2655,30 @@ export default function Rapsody() {
     }
   };
 
+  const updateInstrument = (id, instrument) => {
+    setCanvasInstances((prev) =>
+      prev.map((inst) => (inst.id === id ? { ...inst, instrument } : inst))
+    );
+  };
+
   useEffect(() => {
-    if (!autoPlay || activeIndex === null || !canvasInstances[activeIndex]) return;
+    if (!autoPlay) return;
+    const sections = new Set(canvasInstances.map((c) => c.sectionIndex ?? 0));
+    const totalSections = sections.size || 1;
+    const currentGroup = canvasInstances.filter(
+      (inst) => (inst.sectionIndex ?? 0) === currentSection
+    );
+    if (!currentGroup.length) {
+      stopAutoPlay();
+      return;
+    }
+    const durationMs =
+      Math.max(...currentGroup.map((c) => Math.max(3, c.durationSec || 8))) * 1000;
     if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
-    const durationMs = Math.max(3, canvasInstances[activeIndex].durationSec || 8) * 1000;
     autoTimerRef.current = setTimeout(() => {
-      setActiveIndex((prev) => {
+      setCurrentSection((prev) => {
         const next = prev + 1;
-        if (next >= canvasInstances.length) {
+        if (next >= totalSections) {
           stopAutoPlay();
           return prev;
         }
@@ -2091,7 +2691,7 @@ export default function Rapsody() {
         autoTimerRef.current = null;
       }
     };
-  }, [autoPlay, activeIndex, canvasInstances]);
+  }, [autoPlay, currentSection, canvasInstances]);
 
   useEffect(() => {
     getSharedAudio().setFxEnabled?.(fxEnabled);
@@ -2129,50 +2729,86 @@ export default function Rapsody() {
         maxSections: 5,
         minPerSection: 6,
       });
+      const summarySource = sectionsEvents.length
+        ? sectionsEvents
+        : fallbackSections.map((notes) =>
+            notes.map((name, idx) => ({
+              name,
+              start: idx * 0.5,
+              duration: 0.45,
+              velocity: 0.85,
+            }))
+          );
+      const sectionSummaries = summarySource.map((sec) => summarizeSectionEvents(sec));
       const sections = sectionsEvents.length
         ? sectionsEvents.map((sec) => sec.map((n) => n.name))
         : fallbackSections;
       const tempos = (basePreset.tempos && basePreset.tempos.length) ? basePreset.tempos : DEFAULT_TEMPOS;
       const paletteObj = getThemePalette(theme);
-      const newInstances = sections.map((sectionNotes, idx) => {
+      const newInstances = [];
+      sections.forEach((sectionNotes, idx) => {
         const tempoVariant = tempos.map((t, k) => ({
           ...t,
           angleDeg: (t.angleDeg ?? 0) + idx * 8 * (k % 2 === 0 ? 1 : -1),
         }));
-        const speedBoost = 1.3 + idx * 0.05;
-        const { balls } = buildSequencePreset({
-          notes: sectionNotes,
-          tempos: tempoVariant,
-          bpm: basePreset.bpm,
-          areaW: 900,
-          areaH: 420,
-        });
-        // Aplica boost de energía inicial (velocidad)
-        balls.forEach((ball) => {
-          ball.vx *= speedBoost;
-          ball.vy *= speedBoost;
-        });
-        const themedBalls = applyThemeToBalls(balls, paletteObj);
-        const estimatedDuration =
-          sectionsEvents[idx]?.reduce?.(
-            (acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)),
-            0
-          ) || Math.max(6, sectionNotes.length * 0.5);
-        return {
-          id: Date.now() + idx + Math.random(),
-          preset: {
-            balls: themedBalls,
+        const sectionLabelBase = `${songFile.name} · Sección ${idx + 1}`;
+        const sectionEventsRaw = sectionsEvents[idx] || [];
+        const sectionProfile = getSectionProfileByIndex(idx);
+        const sectionSummary =
+          sectionSummaries[idx] ||
+          summarizeSectionEvents(sectionsEvents[idx] || sectionEventsRaw || []);
+        const baseTimeline = buildTimelineFromEvents(sectionEventsRaw, sectionNotes, basePreset.bpm);
+        const backgroundLayer = buildSectionBackgroundLayer(baseTimeline, sectionProfile, sectionSummary);
+        const percussionSettings = derivePercussionSettings(sectionProfile, sectionSummary);
+        INSTRUMENT_PROFILES.forEach((profile, profIdx) => {
+          const filteredTimeline = baseTimeline.filter((ev) =>
+            (profile.filter?.(ev.note, midiFromNoteName(ev.note)) ?? true)
+          );
+          const effectiveTimeline = filteredTimeline.length ? filteredTimeline : baseTimeline;
+          const notesForInstrument = effectiveTimeline.map((ev) => ev.note);
+          if (!notesForInstrument.length) return;
+          const { balls } = buildSequencePreset({
+            notes: notesForInstrument,
+            tempos: tempoVariant,
             bpm: basePreset.bpm,
-            label: `${songFile.name} · Sección ${idx + 1}`,
-            version: `${songFile.name}-${Date.now()}-${idx}`,
-          },
-          durationSec: Math.max(3, Math.round(estimatedDuration)),
-        };
+            areaW: 900,
+            areaH: 420,
+          });
+          const boosted = boostBallVelocities(balls, 2.0);
+          const themedBalls = applyThemeToBalls(boosted, paletteObj);
+          const durationEstimate =
+            effectiveTimeline.reduce((acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)), 0) ||
+            Math.max(6, notesForInstrument.length * 0.5);
+          const paddedDuration = Math.max(10, Math.round(durationEstimate * 2));
+          const transitions = buildTransitionMap(effectiveTimeline);
+          newInstances.push({
+            id: Date.now() + idx + profIdx + Math.random(),
+            preset: {
+              balls: themedBalls,
+              bpm: basePreset.bpm,
+              label: `${sectionLabelBase} · ${profile.label}`,
+              version: `${songFile.name}-${Date.now()}-${idx}-${profile.voice}`,
+              noteOrder: notesForInstrument,
+              timeline: effectiveTimeline,
+              transitions,
+               sectionKind: sectionProfile.key,
+               sectionProfile,
+               sectionSummary,
+               backgroundMelody: backgroundLayer,
+               percussion: percussionSettings,
+            },
+            durationSec: paddedDuration,
+            instrument: profile.voice,
+            sectionIndex: idx,
+          });
+        });
       });
       setCanvasInstances(
-        newInstances.length ? newInstances : [{ id: Date.now(), preset: null, durationSec: 8 }]
+        newInstances.length
+          ? newInstances
+          : [{ id: Date.now(), preset: null, durationSec: 16, instrument: defaultInstrument, sectionIndex: 0 }]
       );
-      setActiveIndex(0);
+      setCurrentSection(0);
     } catch (err) {
       console.error("Error al analizar archivo:", err);
       alert(err?.message ?? "No pude analizar el archivo.");
@@ -2236,6 +2872,15 @@ export default function Rapsody() {
           />
           FX / Reverb
         </label>
+        <label className="flex items-center gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={backgroundPad}
+            onChange={(e) => setBackgroundPad(e.target.checked)}
+            className="accent-emerald-500"
+          />
+          Melodía de fondo
+        </label>
         <button
           onClick={handleExportProject}
           className="px-4 py-2 rounded-2xl bg-amber-500 hover:bg-amber-600"
@@ -2268,12 +2913,25 @@ export default function Rapsody() {
         >
           {autoPlay ? "Detener secuencia" : "Reproducir secuencial"}
         </button>
+        <button
+          onClick={() => setPlayAll((v) => !v)}
+          disabled={!canvasInstances.length}
+          className={`px-4 py-2 rounded-2xl ${
+            playAll ? "bg-rose-500 hover:bg-rose-600" : "bg-emerald-500 hover:bg-emerald-600"
+          }`}
+        >
+          {playAll ? "Detener todos" : "Reproducir todos"}
+        </button>
         <span className="text-sm text-slate-400 ml-auto">
           {canvasInstances.length} {canvasInstances.length === 1 ? "instancia" : "instancias"} activas
         </span>
       </section>
       <div className="space-y-6">
-        {canvasInstances.map((inst, idx) => (
+        {canvasInstances.map((inst, idx) => {
+          const section = inst.sectionIndex ?? 0;
+          const shouldPlaySection = autoPlay && section === currentSection;
+          const shouldForcePlay = playAll || shouldPlaySection;
+          return (
           <CanvasRig
             key={inst.id}
             instanceIndex={idx}
@@ -2282,12 +2940,16 @@ export default function Rapsody() {
             preset={inst.preset}
             durationSec={inst.durationSec}
             onDurationChange={(val) => updateDuration(inst.id, val)}
-            shouldAutoRun={autoPlay && idx === activeIndex}
+            shouldAutoRun={shouldPlaySection && !playAll}
             autoPlayEnabled={autoPlay}
             themeKey={theme}
             performanceMode={performanceMode}
+            melodyVoice={inst.instrument || defaultInstrument}
+            onInstrumentChange={(val) => updateInstrument(inst.id, val)}
+            forcePlay={shouldForcePlay}
+            backgroundPad={backgroundPad}
           />
-        ))}
+        );})}
       </div>
     </div>
   );
