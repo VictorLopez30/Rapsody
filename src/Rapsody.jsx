@@ -31,6 +31,9 @@ const MELODY_VOICES = [
   { label: "Pad", value: "pad" },
   { label: "Bass", value: "bass" },
   { label: "Blip", value: "blip" },
+  { label: "Guitarra", value: "guitar" },
+  { label: "Flauta", value: "flute" },
+  { label: "Batería", value: "drums" },
 ];
 const INSTRUMENT_PROFILES = [
   { voice: "piano", label: "Piano", filter: () => true },
@@ -41,7 +44,65 @@ const INSTRUMENT_PROFILES = [
     filter: (_, midi) => midi <= 57,
   },
   { voice: "blip", label: "Lead", filter: (note, midi) => midi >= 60 },
+  { voice: "guitar", label: "Guitarra", filter: (_, midi) => midi >= 45 && midi <= 72 },
+  { voice: "flute", label: "Flauta", filter: (_, midi) => midi >= 72 },
+  { voice: "drums", label: "Batería", filter: (_, midi) => midi <= 52 },
 ];
+const CHORD_VOICES = new Set(["piano", "guitar"]);
+const CHORD_INTERVALS = [0, 7, 12];
+const DRUM_NOTE_OPTIONS = [
+  { label: "Kick (C2)", value: "C2" },
+  { label: "Snare (D3)", value: "D3" },
+  { label: "Hat (F#4)", value: "F#4" },
+];
+const SAMPLE_LIBRARY = {
+  piano: {
+    type: "pitched",
+    samples: [
+      { note: "A0", file: "/samples/vsco/piano/Player_dyn2_rr1_000.wav" },
+      { note: "A2", file: "/samples/vsco/piano/Player_dyn2_rr1_012.wav" },
+      { note: "A4", file: "/samples/vsco/piano/Player_dyn2_rr1_024.wav" },
+      { note: "A5", file: "/samples/vsco/piano/Player_dyn2_rr1_030.wav" },
+      { note: "A6", file: "/samples/vsco/piano/Player_dyn2_rr1_036.wav" },
+    ],
+  },
+  flute: {
+    type: "pitched",
+    samples: [
+      { note: "C3", file: "/samples/vsco/flute/LDFlute_expvib_C3_v1_1.wav" },
+      { note: "E4", file: "/samples/vsco/flute/LDFlute_expvib_E4_v1_1.wav" },
+      { note: "A4", file: "/samples/vsco/flute/LDFlute_expvib_A4_v1_1.wav" },
+      { note: "E5", file: "/samples/vsco/flute/LDFlute_expvib_E5_v1_1.wav" },
+      { note: "A5", file: "/samples/vsco/flute/LDFlute_expvib_A5_v1_1.wav" },
+      { note: "C6", file: "/samples/vsco/flute/LDFlute_expvib_C6_v1_1.wav" },
+    ],
+  },
+  guitar: {
+    type: "pitched",
+    samples: [
+      { note: "B1", file: "/samples/vsco/guitar/KSHarp_B1_mf.wav" },
+      { note: "D2", file: "/samples/vsco/guitar/KSHarp_D2_mf.wav" },
+      { note: "F2", file: "/samples/vsco/guitar/KSHarp_F2_mf.wav" },
+      { note: "A2", file: "/samples/vsco/guitar/KSHarp_A2_mf.wav" },
+      { note: "C3", file: "/samples/vsco/guitar/KSHarp_C3_mf.wav" },
+      { note: "E3", file: "/samples/vsco/guitar/KSHarp_E3_mf.wav" },
+      { note: "G3", file: "/samples/vsco/guitar/KSHarp_G3_mf.wav" },
+      { note: "B3", file: "/samples/vsco/guitar/KSHarp_B3_mf.wav" },
+      { note: "D4", file: "/samples/vsco/guitar/KSHarp_D4_mf.wav" },
+      { note: "F4", file: "/samples/vsco/guitar/KSHarp_F4_mf.wav" },
+      { note: "A4", file: "/samples/vsco/guitar/KSHarp_A4_mf.wav" },
+      { note: "C5", file: "/samples/vsco/guitar/KSHarp_C5_mf.wav" },
+    ],
+  },
+  drums: {
+    type: "drum",
+    samples: {
+      kick: "/samples/vsco/drums/bdrum_f_1.wav",
+      snare: "/samples/vsco/drums/Snare2-HitSN_v1_rr1_Sum.wav",
+      hat: "/samples/vsco/drums/cymbal-crashshort_v1.wav",
+    },
+  },
+};
 const SECTION_SEQUENCE = ["intro", "verse", "chorus", "verse", "chorus", "bridge", "chorus", "outro"];
 const SECTION_PROFILES = {
   intro: {
@@ -872,6 +933,92 @@ rim(time = ctx.currentTime) {
   const mediaDest = ctx.createMediaStreamDestination();
   comp.connect(mediaDest);
 
+  const sampleState = {
+    buffers: {},
+    loading: {},
+  };
+  const loadSampleBuffer = async (url) => {
+    if (sampleState.buffers[url]) return sampleState.buffers[url];
+    const res = await fetch(url);
+    const arr = await res.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arr);
+    sampleState.buffers[url] = buf;
+    return buf;
+  };
+  const ensureInstrumentSamples = (instrument) => {
+    if (sampleState.loading[instrument]) return sampleState.loading[instrument];
+    const spec = SAMPLE_LIBRARY[instrument];
+    if (!spec) return Promise.resolve([]);
+    if (spec.type === "drum") {
+      sampleState.loading[instrument] = Promise.all(
+        Object.entries(spec.samples).map(async ([key, url]) => [key, await loadSampleBuffer(url)])
+      ).then((pairs) => {
+        sampleState.buffers[instrument] = Object.fromEntries(pairs);
+        return sampleState.buffers[instrument];
+      });
+      return sampleState.loading[instrument];
+    }
+    sampleState.loading[instrument] = Promise.all(
+      spec.samples.map(async (sample) => ({
+        buffer: await loadSampleBuffer(sample.file),
+        rootMidi: midiFromNoteName(sample.note),
+      }))
+    ).then((list) => {
+      sampleState.buffers[instrument] = list;
+      return list;
+    });
+    return sampleState.loading[instrument];
+  };
+  const getClosestSample = (instrument, midi) => {
+    const list = sampleState.buffers[instrument];
+    if (!Array.isArray(list) || !list.length) return null;
+    let best = list[0];
+    let bestDiff = Math.abs(midi - best.rootMidi);
+    for (const entry of list) {
+      const diff = Math.abs(midi - entry.rootMidi);
+      if (diff < bestDiff) {
+        best = entry;
+        bestDiff = diff;
+      }
+    }
+    return best;
+  };
+  const playSample = (instrument, noteName, when = ctx.currentTime, vel = 1.0, durationSec = 0.6) => {
+    const spec = SAMPLE_LIBRARY[instrument];
+    if (!spec) return false;
+    if (!sampleState.buffers[instrument]) {
+      ensureInstrumentSamples(instrument);
+      return false;
+    }
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(Math.max(0.05, Math.min(1.4, vel)), when);
+    if (spec.type === "drum") {
+      const midi = midiFromNoteName(noteName);
+      const kit = sampleState.buffers[instrument];
+      const key = midi < 50 ? "kick" : midi < 62 ? "snare" : "hat";
+      const buffer = kit?.[key];
+      if (!buffer) return false;
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(gain).connect(master);
+      src.start(when);
+      return true;
+    }
+    const midi = midiFromNoteName(noteName);
+    const sample = getClosestSample(instrument, midi);
+    if (!sample?.buffer) return false;
+    const src = ctx.createBufferSource();
+    src.buffer = sample.buffer;
+    src.playbackRate.setValueAtTime(Math.pow(2, (midi - sample.rootMidi) / 12), when);
+    const hold = Math.max(0.12, durationSec || 0.6);
+    gain.gain.setValueAtTime(Math.max(0.05, Math.min(1.2, vel)), when);
+    gain.gain.exponentialRampToValueAtTime(0.0001, when + hold);
+    src.connect(gain).connect(master);
+    src.start(when);
+    src.stop(when + hold + 0.05);
+    return true;
+  };
+  const preloadSamples = (instrument) => ensureInstrumentSamples(instrument);
 
 function playNoteByName(noteName, when = ctx.currentTime, vel = 1.0) {
   const midi = midiFromNoteName(noteName);
@@ -914,7 +1061,7 @@ function playNoteByName(noteName, when = ctx.currentTime, vel = 1.0) {
 }
 
 
-  return { ctx, master, voices, mediaDest, playNoteByName };
+  return { ctx, master, voices, mediaDest, playNoteByName, playSample, preloadSamples };
 }
 
 let sharedAudio = null;
@@ -1244,6 +1391,18 @@ const resizingRef = useRef(null);
     setFlashAlpha(0.6);
   }, [shouldAutoRun]);
   useEffect(() => {
+    if (melodyVoice !== "drums") return;
+    applyBallsUpdate((prev) => {
+      let drumIdx = 0;
+      return prev.map((ball) => {
+        if (ball.type !== "note") return ball;
+        const drumNote = DRUM_NOTE_OPTIONS[drumIdx % DRUM_NOTE_OPTIONS.length]?.value || "C2";
+        drumIdx += 1;
+        return { ...ball, note: drumNote };
+      });
+    });
+  }, [melodyVoice]);
+  useEffect(() => {
     const currentMax = backgroundEventsRef.current.reduce(
       (acc, ev) => Math.max(acc, (ev.start ?? 0) + (ev.duration ?? 0.4)),
       0
@@ -1272,6 +1431,10 @@ const resizingRef = useRef(null);
   useEffect(() => {
     noteOrderRef.current = noteOrder;
     noteIndexRef.current = 0;
+    if (melodyVoice === "drums") {
+      setAllowedNotes([]);
+      return;
+    }
     if (timelineEventsRef.current.length) {
       setAllowedNotes([timelineEventsRef.current[0].note]);
     } else if (noteOrder[0]) {
@@ -1279,14 +1442,20 @@ const resizingRef = useRef(null);
     } else {
       setAllowedNotes([]);
     }
-  }, [noteOrder]);
+  }, [melodyVoice, noteOrder]);
   const resetNoteOrder = useCallback(() => {
     noteIndexRef.current = 0;
     const firstTimeline = timelineEventsRef.current[0]?.note;
-    if (firstTimeline) setAllowedNotes([firstTimeline]);
-    else if (noteOrderRef.current[0]) setAllowedNotes([noteOrderRef.current[0]]);
-    else setAllowedNotes([]);
-  }, []);
+    if (melodyVoice === "drums") {
+      setAllowedNotes([]);
+    } else if (firstTimeline) {
+      setAllowedNotes([firstTimeline]);
+    } else if (noteOrderRef.current[0]) {
+      setAllowedNotes([noteOrderRef.current[0]]);
+    } else {
+      setAllowedNotes([]);
+    }
+  }, [melodyVoice]);
   const allowedNoteLabel = allowedNotes?.length ? allowedNotes.join(", ") : "—";
 
   const draggingIdRef = useRef(null);
@@ -1316,28 +1485,48 @@ const resizingRef = useRef(null);
     if (audioRef.current.ctx.state !== "running") audioRef.current.ctx.resume();
   }, []);
 
-  const playInstrumentNote = useCallback((note, when, velocity = 1.0) => {
+  const playInstrumentNote = useCallback((note, when, velocity = 1.0, durationSec = 0.6) => {
     if (!note) return;
     ensureAudio();
-    const { playNoteByName, voices } = audioRef.current;
+    const { playNoteByName, playSample, preloadSamples, voices } = audioRef.current;
+    if (SAMPLE_LIBRARY[melodyVoice]) preloadSamples?.(melodyVoice);
     const midi = midiFromNoteName(note);
     const freq = freqFromMidi(midi);
-    switch (melodyVoice) {
-      case "pad":
-        voices.pad?.(when, freq);
-        break;
-      case "bass":
-        voices.bass?.(when, freq);
-        break;
-      case "blip":
-        (voices.blip || playNoteByName)(when);
-        playNoteByName(note, when, velocity * 0.7);
-        break;
-      default:
-        playNoteByName(note, when, velocity);
-        break;
+    const playChord = (rootNote, baseVelocity) => {
+      CHORD_INTERVALS.forEach((interval, idx) => {
+        const chordMidi = midiFromNoteName(rootNote) + interval;
+        const chordNote = nameFromMidi(chordMidi);
+        const v = idx === 0 ? baseVelocity : baseVelocity * 0.55;
+        const played = playSample?.(melodyVoice, chordNote, when, v, durationSec);
+        if (!played) playNoteByName(chordNote, when, v);
+      });
+    };
+    if (melodyVoice === "pad") {
+      voices.pad?.(when, freq);
+    } else if (melodyVoice === "bass") {
+      voices.bass?.(when, freq);
+    } else if (melodyVoice === "blip") {
+      (voices.blip || playNoteByName)(when);
+      playNoteByName(note, when, velocity * 0.7);
+    } else if (melodyVoice === "drums") {
+      const played = playSample?.("drums", note, when, velocity, durationSec);
+      if (!played) {
+        const midi = midiFromNoteName(note);
+        if (midi < 50) voices.kick?.(when);
+        else if (midi < 62) voices.snare?.(when);
+        else voices.hat?.(when);
+      }
+    } else if (SAMPLE_LIBRARY[melodyVoice]) {
+      if (CHORD_VOICES.has(melodyVoice)) {
+        playChord(note, velocity);
+      } else {
+        const played = playSample?.(melodyVoice, note, when, velocity, durationSec);
+        if (!played) playNoteByName(note, when, velocity);
+      }
+    } else {
+      playNoteByName(note, when, velocity);
     }
-    if (backgroundPad) {
+    if (backgroundPad && melodyVoice !== "drums") {
       if (melodyVoice !== "pad") voices.pad?.(when + 0.01, freq);
       if (melodyVoice !== "bass") voices.bass?.(when + 0.02, freq / 2);
     }
@@ -1347,6 +1536,14 @@ const resizingRef = useRef(null);
     if (!audioRef.current) return;
     const { ctx } = audioRef.current;
   
+    if (melodyVoice === "drums") {
+      const sub = tempoBall?.tempoQuant || quant;
+      const t = ctx.currentTime + 0.03;
+      const qt = nextQuantizedTime(t, bpm, sub * 4);
+      const vel = Math.max(0.1, Math.min(1.5, tempoBall?.velocity ?? 1.0));
+      playInstrumentNote(noteBall.note, qt, vel);
+      return;
+    }
     const sequence = noteOrderRef.current;
     const allowedSet = allowedNotes?.length ? allowedNotes : sequence;
     if (allowedSet.length && !allowedSet.includes(noteBall.note)) return;
@@ -1356,7 +1553,8 @@ const resizingRef = useRef(null);
     const qt = nextQuantizedTime(t, bpm, sub * 4);
  
     const vel = Math.max(0.1, Math.min(1.5, tempoBall?.velocity ?? 1.0));
-    playInstrumentNote(noteBall.note, qt, vel);
+    const dur = (60 / Math.max(40, bpm)) * ((sub || quant) * 4) * 0.9;
+    playInstrumentNote(noteBall.note, qt, vel, dur);
     const transitions = markovMapRef.current[noteBall.note];
     if (transitions && Object.keys(transitions).length) {
       setAllowedNotes([weightedPick(transitions)]);
@@ -1367,7 +1565,7 @@ const resizingRef = useRef(null);
     } else {
       setAllowedNotes([]);
     }
-  }, [allowedNotes, bpm, playInstrumentNote, quant]);
+  }, [allowedNotes, bpm, melodyVoice, playInstrumentNote, quant]);
   const triggerComboRef = useRef(triggerCombo);
   useEffect(() => { triggerComboRef.current = triggerCombo; }, [triggerCombo]);
 
@@ -1392,7 +1590,7 @@ const resizingRef = useRef(null);
       ) {
         const ev = list[timelineCursorRef.current];
         const when = timelineStartRef.current + (ev.start ?? 0);
-        if (when >= now) playInstrumentNote(ev.note, when, ev.velocity ?? 0.9);
+        if (when >= now) playInstrumentNote(ev.note, when, ev.velocity ?? 0.9, ev.duration ?? 0.6);
         if (
           backgroundPad &&
           !backgroundEventsRef.current.length &&
@@ -2062,9 +2260,13 @@ const resizingRef = useRef(null);
                         onChange={(e) => updateBallNote(b.id, e.target.value)}
                         className="bg-slate-700 rounded-xl px-2 py-1 text-sm"
                       >
-                        {NOTE_NAMES_88.map((n) => (
-                          <option key={n} value={n}>{n}</option>
-                        ))}
+                        {(melodyVoice === "drums" ? DRUM_NOTE_OPTIONS : NOTE_NAMES_88).map((n) =>
+                          melodyVoice === "drums" ? (
+                            <option key={n.value} value={n.value}>{n.label}</option>
+                          ) : (
+                            <option key={n} value={n}>{n}</option>
+                          )
+                        )}
                       </select>
                     ) : (
                       <div className="flex items-center gap-2">
